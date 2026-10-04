@@ -218,7 +218,11 @@ def _tv_sig_affected_subscriptions(new_data, old_data):
     new_sig, old_sig = _tv_sig(new_data), _tv_sig(old_data or {})
     if new_sig == old_sig:
         return None
-    changed_titles = {(name or '').casefold() for (_src, _cat, name, _c, _ts) in (new_sig - old_sig)}
+    # 复审修正：两侧同口径——入库标题与订阅名都过 lib._normalize_title 再 casefold
+    # （tmdb 后缀/全角/分隔符差异否则会让 normalize 后的订阅名匹配不上原始入库标题）
+    changed_titles = {lib._normalize_title(name or '').casefold()
+                      for (_src, _cat, name, _c, _ts) in (new_sig - old_sig)}
+    changed_titles.discard('')
     if not changed_titles:
         return set()
     subscribed = set()

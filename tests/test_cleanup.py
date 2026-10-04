@@ -210,3 +210,36 @@ class TestA11:
         for kw in ('quality', 'rule_sig'):
             assert kw in eng.lower() or kw in safety.lower()
         assert 'plan' in safety.lower() and 'confirm' in safety.lower()
+
+
+class TestManualDoneKeyConsistency:
+    """复审修复回归：完结标记存储键是 Emby 条目 id；应用点按 Emby id / tmdb_id
+    双键位匹配（只用 tmdb_id 查表会让现有用户标记永远失效）。"""
+
+    def test_manual_done_for_double_key(self):
+        done = {'S1': {'name': '剧', 'ts': 1}}
+        assert facts.manual_done_for(done, ['S1'], '8888') is True    # Emby id 命中
+        assert facts.manual_done_for(done, ['S9'], '8888') is False   # 两键都不在 → 未标记
+        assert facts.manual_done_for({'8888': {'ts': 1}}, ['S9'], '8888') is True  # tmdb_id 键也认
+        assert facts.manual_done_for({}, ['S1'], '8888') is False
+
+    def test_get_series_status_uses_done_set(self, isolated_db, monkeypatch):
+        def fake(path, params=None, method='GET', timeout=15):
+            params = params or {}
+            if params.get('IncludeItemTypes') == 'Series':
+                return {'Items': [{'Id': 'S1', 'Name': '剧', 'Path': '/media/local/x',
+                                   'ProviderIds': {'Tmdb': '8888'}}]}
+            return {'Items': []}
+        monkeypatch.setattr(emby, 'emby_request', fake)
+        monkeypatch.setattr(facts, '_load_tmdb_info', lambda tid: {
+            'name': '剧', 'status': 'Ended', 'aired': {(1, e) for e in range(1, 26)},
+            'total_episodes': 25, 'declared_total': 25,
+            'seasons': {1: {'episode_count': 25}}})
+        # 只有部分集在库 + 已完结 → 本应缺集；Emby id 键的完结标记 → 完整
+        monkeypatch.setattr(facts, 'series_episodes', lambda rows: {
+            'episodes': {facts.ep_key(1, e) for e in range(1, 23)},
+            'local': set(), 'share': set(), 'special': set(), 'created': {},
+            'series_ids': ['S1'], 'series_name': '剧'})
+        out = facts.get_series_status('8888', manual_done_set={'S1': {'ts': 1}})
+        assert out['classification']['status'] == 'complete'
+        assert out['classification']['manual_done'] is True

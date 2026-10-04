@@ -196,9 +196,12 @@ class TestExploreStatusEndpoint:
         assert row['tmdb_id'] == TMDB_ID
 
     def test_manual_done_passed_into_classify(self, isolated_db, monkeypatch):
-        """手动完结标记必须传入 classify：防撤回版「手动完结被打回缺集」漏洞。"""
+        """手动完结标记必须传入 classify：防撤回版「手动完结被打回缺集」漏洞。
+
+        复审修正：存储键是 Emby 条目 id（同实际写入口径），匹配走 Emby id/tmdb_id
+        双键位。"""
         from app.routers.library import api_explore_status
-        storage.db_doc_put(storage.DOC_MANUAL_DONE, {TMDB_ID: {'name': '测试剧', 'ts': 1}})
+        storage.db_doc_put(storage.DOC_MANUAL_DONE, {'S1': {'name': '测试剧', 'ts': 1}})
         with _EmbyEnv():
             monkeypatch.setattr(facts, '_load_tmdb_info', lambda tid: _tv_info('Returning Series', total=25))
             r = api_explore_status(ids=TMDB_ID, media='tv')

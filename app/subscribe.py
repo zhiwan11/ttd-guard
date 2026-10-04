@@ -393,10 +393,18 @@ def _run_subscription_check(send_notify=True, self_delivered=False) -> dict:
     # 都不满足：只读预览，绝不落盘。
     sent_ok = True
     if send_notify and updates:
-        # 文案统一由 tgmsg 渲染（与 Bot /sub check、晨报「订阅更新」同一份实现）
-        sent_ok = tg.notify_telegram(str(tgmsg_reports.sub_notify(updates)))
+        # S4 通知规则（§5.4）：只推「值得提醒」的变化（新增集里有超过已看进度的、
+        # 或缺集/补齐变化）；全部新增都不超过已看进度的只记账不推送——
+        # 记账照常进行（notified_episodes 照常推进），下一轮不会重复提醒。
+        worth = [u for u in updates if u.get('worth_notifying', True)]
+        if worth:
+            # 文案统一由 tgmsg 渲染（与 Bot /sub check、晨报「订阅更新」同一份实现）
+            sent_ok = tg.notify_telegram(str(tgmsg_reports.sub_notify(worth)))
+        else:
+            sent_ok = True                       # 无值得提醒的：视为已处理
+            log.info('追更变化 %d 部均不值得提醒（新增未超过已看进度），只记账不推送', len(updates))
         if sent_ok:
-            _save_subscription_report(updates)
+            _save_subscription_report(worth or updates)
         else:
             log.warning('追更订阅推送失败，本轮不记账，下次继续重试')
 

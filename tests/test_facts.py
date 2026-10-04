@@ -254,15 +254,6 @@ class TestErrorsPropagate:
                                  'ProviderIds': {'Tmdb': '9999'}}]
             assert facts.find_series(TMDB_ID) == []
 
-    def test_refresh_screen_facts_reports_error_explicitly(self, isolated_db):
-        with _Env() as env:
-            def boom(path, params=None, method='GET', timeout=15):
-                raise RuntimeError('Emby 超时')
-            emby.emby_request = boom
-            out = facts.refresh_screen_facts([{'tmdb_id': TMDB_ID, 'type': 'tv'}])
-            assert len(out) == 1
-            assert out[0]['status'] == 'error' and 'Emby 超时' in out[0]['reason']
-
 
 # ═══════════ ⑤ payload 往返键保持 'S01E02' ═══════════
 
@@ -321,10 +312,11 @@ class TestSingleWrite:
             assert facts.load_fact('tv', TMDB_ID)['updated_at'] >= before
             assert out2['classification']['status'] == 'complete'
 
-    def test_refresh_screen_facts_concurrent(self, isolated_db, monkeypatch):
-        """并发编排：多卡同时重验（撤回版串行的回归）。TMDB 查询打桩，
-        只测 Emby 并发路径。"""
+    def test_explore_status_concurrent(self, isolated_db, monkeypatch):
+        """并发编排（S7 复审：改测生产实现 /api/explore/status，撤回版串行的回归）。
+        TMDB 查询打桩，只测 Emby 并发路径。"""
         import time as _t
+        from app.routers.library import api_explore_status
         with _Env() as env:
             monkeypatch.setattr(facts, '_load_tmdb_info', lambda tid: _tv_info('Ended', total=2))
             env.series_items = [{'Id': 'S%d' % i, 'Name': '剧%d' % i,
@@ -337,12 +329,11 @@ class TestSingleWrite:
                     _t.sleep(0.2)            # 每部剧的分集查询慢 0.2s
                 return {'Items': _full({1: 2})}
             emby.emby_request = slow
-            items = [{'tmdb_id': str(1000 + i), 'type': 'tv'} for i in range(4)]
             t0 = _t.monotonic()
-            out = facts.refresh_screen_facts(items)
+            out = api_explore_status(ids=','.join(str(1000 + i) for i in range(4)), media='tv')
             el = _t.monotonic() - t0
-            assert len(out) == 4 and all(o['status'] == 'success' for o in out)
-            assert el < 0.6, '串行应约 0.8s（4×0.2），并发 4 线程应显著低于该值（实测 %.2fs）' % el
+            assert len(out['data']) == 4 and all(o['status'] == 'success' for o in out['data'])
+            assert el < 0.6, '串行应约 0.8s（4×0.2），并发 8 线程应显著低于该值（实测 %.2fs）' % el
 
 
 # ═══════════ ⑦ find_series 三层兜底与薄封装口径 ═══════════
@@ -433,3 +424,19 @@ class TestFindSeriesLayers:
         assert morning._stat_bucket('missing') == 'missing'
         assert morning._stat_bucket('unmatched') == 'unmatched'
         assert morning._cn_status('no_tmdb') == 'unmatched'
+
+
+class TestGhostFilter:
+    """复审修复回归：series_episodes 剔除幽灵分集（与 media.live_episodes 同口径），
+    已删源的 STRM 残留不进 have——追更与缺集不少报。"""
+
+    def test_ghost_episodes_excluded(self, isolated_db, monkeypatch):
+        with _Env() as env:
+            env.episodes = [
+                _ep(1, 1, '/media/local/S01E01.strm'),
+                _ep(1, 2, '/media/local/S01E02.strm'),      # 幽灵（文件与目录都不存在）
+            ]
+            monkeypatch.setattr(media, 'is_ghost',
+                                lambda p: p.endswith('S01E02.strm'))
+            eps = facts.series_episodes(['S1'])
+            assert eps['episodes'] == {'S01E01'}

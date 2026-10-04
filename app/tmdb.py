@@ -12,7 +12,7 @@ from . import config as _cfg
 from . import logger
 from .core import (esc, parse_season_dir, get_ep, title_key, governance_title_key,
                    analyze_season_episodes, parse_emby_library, quality_label, RE_SXXEXX)
-from . import state, emby, lib, storage, media, sync
+from . import state, emby, lib, storage, media, sync, facts
 
 log = logging.getLogger('media_agent')
 
@@ -209,6 +209,45 @@ def action_explore(args):
             'tmdb_calls': t.calls, 'tmdb_hits': t.hits}
 
 
+def normalize_tmdb_info(tmdb_info):
+    """把 TMDB 数据规整成 facts.classify 的契约形态（aired 为 (季,集) 键集合）。
+
+    两种输入都接受（§2.4/§5.3 已播唯一口径）：
+      - 原始 /tv/{id} 响应 / _tmdb_series_info 产物：走 media.tmdb_aired_map 的
+        **截断口径**（按 last_episode_to_air 裁剪、排除 S00）——未播集绝不进 aired；
+      - 旧 fake 形态（晨报 _resync 由缓存逐季集数拼出）没有 last_episode_to_air，
+        截断无依据，才退回按各季 episode_count 全量展开。
+    已含 aired 键的（facts 形态）原样返回；None 返回 None。
+    """
+    if not tmdb_info or 'aired' in tmdb_info:
+        return tmdb_info
+    aired_map = media.tmdb_aired_map(tmdb_info)      # 有 last_episode_to_air → 精确截断
+    if aired_map:
+        aired = set()
+        for sn, n in aired_map.items():
+            for e in range(1, n + 1):
+                k = facts.ep_key(sn, e)
+                if k:
+                    aired.add(k)
+    else:
+        # 无 last_episode_to_air 的回退口径（与旧实现 season_count 求和等价）
+        aired = set()
+        for s in (tmdb_info.get('seasons') or []):
+            sn = s.get('season_number')
+            if sn is None or int(sn) <= 0:
+                continue
+            for e in range(1, int(s.get('episode_count') or 0) + 1):
+                k = facts.ep_key(int(sn), e)
+                if k:
+                    aired.add(k)
+    fake = dict(tmdb_info)
+    fake['aired'] = aired
+    totals = media.tmdb_totals(tmdb_info)
+    fake['total_episodes'] = totals['aired'] if aired_map else len(aired)
+    fake['declared_total'] = totals['declared']
+    return fake
+
+
 def classify_series_by_tmdb(local_seasons, tmdb_info, manual_done=False):
     """按 TMDB 已播集数对照片库（S1 起为 facts.classify 的薄封装，§5.3 唯一口径）。
 
@@ -227,26 +266,7 @@ def classify_series_by_tmdb(local_seasons, tmdb_info, manual_done=False):
                 k = facts.ep_key(s['season'], e)
                 if k:
                     keys.add(k)
-    # 旧 fake 形态（晨报 _resync 里由缓存 tmdb_status/tmdb 逐季集数拼出）没有
-    # last_episode_to_air，不能走 media.tmdb_aired_map 的截断口径——直接按
-    # 各季 episode_count 展开成已播集合（与旧实现把 season_count 求和等价）。
-    if tmdb_info and 'aired' not in tmdb_info:
-        # 没有真 aired 集合时，标称总数退回 media.tmdb_totals（含未播，展示口径），
-        # 已播集合按各季 episode_count 展开（与旧实现 season_count 求和等价）。
-        fake_aired = set()
-        for s in (tmdb_info.get('seasons') or []):
-            sn = s.get('season_number')
-            if sn is None or int(sn) <= 0:
-                continue
-            for e in range(1, int(s.get('episode_count') or 0) + 1):
-                k = facts.ep_key(int(sn), e)
-                if k:
-                    fake_aired.add(k)
-        fake = dict(tmdb_info)
-        fake['aired'] = fake_aired
-        fake['total_episodes'] = media.tmdb_totals(tmdb_info)['aired'] if tmdb_info.get('last_episode_to_air') else len(fake_aired)
-        fake['declared_total'] = media.tmdb_totals(tmdb_info)['declared']
-        tmdb_info = fake
+    tmdb_info = normalize_tmdb_info(tmdb_info)
     cls = facts.classify(keys, tmdb_info, manual_done=manual_done)
     local_map = {s['season']: s['episodes'] for s in (local_seasons or []) if s['season'] > 0}
     local_total = sum(local_map.values())

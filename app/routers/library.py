@@ -135,10 +135,12 @@ def api_explore_status(ids: str = '', media: str = 'tv'):
     if media not in ('tv', 'movie'):
         return {'status': 'error', 'message': 'media 必须是 tv 或 movie'}
 
-    done_ids = set()
+    # 复审修正：完结标记的键是 Emby 条目 id——传整份 done dict，由
+    # facts.get_series_status 在拿到 SeriesId 后按「Emby id / tmdb_id 双键位」匹配
+    done = {}
     if media == 'tv':
         try:
-            done_ids = {str(k) for k, _v in (morning.read_manual_done() or {}).items()}
+            done = morning.read_manual_done() or {}
         except Exception as e:
             logging.getLogger('media_agent').warning('探索第二段读取手动完结失败: %s', e)
 
@@ -146,7 +148,7 @@ def api_explore_status(ids: str = '', media: str = 'tv'):
         try:
             if media == 'movie':
                 return facts.get_movie_status(tid)
-            return facts.get_series_status(tid, manual_done=(tid in done_ids))
+            return facts.get_series_status(tid, manual_done_set=done)
         except Exception as e:            # EmbyFactError 及一切意外都显式化，不冒充「未入库」
             return {'status': 'error', 'tmdb_id': tid, 'message': str(e)}
 
@@ -263,10 +265,10 @@ def api_mapping_verify(ids: str = '', media: str = 'tv'):
     if media not in ('tv', 'movie'):
         return {'status': 'error', 'message': 'media 必须是 tv 或 movie'}
 
-    done_ids = set()
+    done = {}
     if media == 'tv':
         try:
-            done_ids = {str(k) for k, _v in (morning.read_manual_done() or {}).items()}
+            done = morning.read_manual_done() or {}
         except Exception as e:
             logging.getLogger('media_agent').warning('映射重验读取手动完结失败: %s', e)
 
@@ -274,7 +276,7 @@ def api_mapping_verify(ids: str = '', media: str = 'tv'):
         try:
             if media == 'movie':
                 return facts.get_movie_status(tid)
-            return facts.get_series_status(tid, manual_done=(tid in done_ids))
+            return facts.get_series_status(tid, manual_done_set=done)
         except Exception as e:            # EmbyFactError 及一切意外都显式化，不冒充「未入库」
             return {'status': 'error', 'tmdb_id': tid, 'message': str(e)}
 

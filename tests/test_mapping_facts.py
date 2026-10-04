@@ -183,9 +183,12 @@ class TestCacheOnlyAbolished:
 class TestManualDoneNotOverwritten:
 
     def test_mapping_verify_carries_manual_done(self, isolated_db, monkeypatch):
-        """/api/mapping/verify 携带手动完结：在更+落后 → 完整（不被打回缺集）。"""
+        """/api/mapping/verify 携带手动完结：在更+落后 → 完整（不被打回缺集）。
+
+        复审修正：标记的存储键是 Emby 条目 id（前端传卡片 id），匹配走
+        Emby id / tmdb_id 双键位——只用 tmdb_id 查表是 S3 期间的口径错误。"""
         from app.routers.library import api_mapping_verify
-        storage.db_doc_put(storage.DOC_MANUAL_DONE, {TMDB_ID: {'name': '测试剧', 'ts': 1}})
+        storage.db_doc_put(storage.DOC_MANUAL_DONE, {'S1': {'name': '测试剧', 'ts': 1}})
         with _EmbyEnv(episodes=_full({1: 15})):
             monkeypatch.setattr(facts, '_load_tmdb_info', lambda tid: _tv_info('Returning Series', total=25))
             r = api_mapping_verify(ids=TMDB_ID, media='tv')
@@ -273,3 +276,45 @@ class TestScanWritesBackFacts:
         assert fact and fact['matched'] is True
         # 电影事实（无电影 → 无行，不炸）
         assert storage.db_facts_all('movie') == []
+
+
+# ═══════════ 复审回归：事实回写的 TMDB 口径 ═══════════
+
+class TestSyncFactTmdbNormalize:
+    """复审修复回归：原始 /tv/{id} 响应必须经 normalize_tmdb_info 规整后分类，
+    未播集不算缺集、TMDB None 不回写。"""
+
+    def test_raw_response_ended_missing_not_extra(self, isolated_db):
+        entry = {'tmdb_id': '8888', 'name': '剧', 'series_ids': ['S1'],
+                 'in_local': True, 'in_share': False,
+                 'seasons': [{'season': 1, 'episodes': 22, 'max_ep': 25,
+                              'missing': [23, 24, 25]}]}
+        raw = {'status': 'Ended',
+               'seasons': [{'season_number': 1, 'episode_count': 25}],
+               'last_episode_to_air': {'season_number': 1, 'episode_number': 25}}
+        cls = morning._sync_series_fact(entry, raw)
+        assert cls['status'] == 'missing' and cls['missing_ranges'] == 'S01E23–E25'
+
+    def test_raw_response_ongoing_unaired_not_missing(self, isolated_db):
+        """在更剧已播 S01E01-10 + S02E01-3（S02 标称 5），库内全部 → 在更；
+        S02E04/E05 未播不算缺。"""
+        entry = {'tmdb_id': '8888', 'name': '剧', 'series_ids': ['S1'],
+                 'in_local': True, 'in_share': False,
+                 'seasons': [{'season': 1, 'episodes': 10, 'max_ep': 10, 'missing': []},
+                             {'season': 2, 'episodes': 3, 'max_ep': 3, 'missing': []}]}
+        raw = {'status': 'Returning Series',
+               'seasons': [{'season_number': 1, 'episode_count': 10},
+                           {'season_number': 2, 'episode_count': 5}],
+               'last_episode_to_air': {'season_number': 2, 'episode_number': 3}}
+        cls = morning._sync_series_fact(entry, raw)
+        assert cls['status'] == 'ongoing' and cls['missing_ranges'] == ''
+
+    def test_tmdb_none_skips_writeback(self, isolated_db):
+        """TMDB 查询失败 → 不回写事实库（保留上一轮好数据，不写成未匹配）。"""
+        facts._persist_fact('tv', '8888', {'matched': True,
+                                           'classification': {'status': 'missing'}})
+        entry = {'tmdb_id': '8888', 'name': '剧', 'series_ids': ['S1'],
+                 'seasons': [{'season': 1, 'episodes': 3, 'max_ep': 3, 'missing': []}]}
+        assert morning._sync_series_fact(entry, None) is None
+        fact = facts.load_fact('tv', '8888')
+        assert fact['classification']['status'] == 'missing'

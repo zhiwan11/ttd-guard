@@ -238,8 +238,9 @@ class TestNotifyRuleAndCopy:
             assert '新入库 <b>S01E16–E18</b>' in text
             assert 'S01E12' not in text
 
-    def test_new_eps_below_watch_still_recorded(self, isolated_db):
-        """新增集全部 ≤ 已看进度：不值得提醒（不提示新入库诱导），但仍记账不丢。"""
+    def test_new_eps_below_watch_not_pushed_but_recorded(self, isolated_db):
+        """新增集全部 ≤ 已看进度：不值得提醒——不推送（白皮书 §5.4 字面语义），
+        但记账照常推进不丢，下一轮不会重复提醒。"""
         with _Env() as env:
             env.watched = {'u1': [{'SeriesId': 'S1', 'ParentIndexNumber': 1,
                                    'IndexNumber': 30}]}
@@ -250,7 +251,10 @@ class TestNotifyRuleAndCopy:
             u = r['updates'][0]
             assert u['new_eps'] == ['S01E16', 'S01E17', 'S01E18']    # 记账不丢
             assert u['worth_notifying'] is False
-            assert '都不超过已看进度' in env.sent[-1]
+            assert env.sent == []                       # 不值得提醒 → 不推送
+            # 记账已推进：下一轮无重复提醒
+            assert subscribe.check_subscriptions(send_notify=True)['updates'] == []
+            assert env.state()['latest_ep'] == 'S01E18'
 
     def test_copy_contains_totals(self, isolated_db):
         """文案尾部「（共 N 集，已播 M）」。"""

@@ -33,12 +33,20 @@ def _sync_series_fact(entry, tmdb_info, manual_done=False):
       借鉴撤回版「免二次查 Emby」：直接回写 media_facts，探索/订阅读事实层时
       不用再对同一部剧现查一遍；
     - 分类统一走 facts.classify（全仓唯一分类函数）并把分类结果随同一份 payload
-      一次落盘（同一条事实只写一次库）；
+      一次落盘（同一条事实只写一次库）；tmdb_info 先经 tmdb.normalize_tmdb_info
+      规整（原始 /tv/{id} 响应没有 aired 集合，直传会让 aired 恒为空、分类恒错）；
+    - TMDB 查询失败（tmdb_info=None）时**不改写已有分类口径**：沿用条目上已算出的
+      tmdb_info（classify_series_by_tmdb 对 None 给出的未匹配分类不落事实库），
+      避免「TMDB 网络抖动把有事实的剧写成未匹配」；
     - morning 不再调 facts 私有 API（facts._load_tmdb_info 等）。
     """
     tid = entry.get('tmdb_id')
     if not tid:
         return None
+    if tmdb_info is None:
+        # TMDB 查询失败：跳过事实回写（保留库里上一轮的好数据），条目分类照常展示
+        return None
+    info = tmdb.normalize_tmdb_info(tmdb_info)
     have = set()
     for se in (entry.get('seasons') or []):
         sn = se.get('season', 0)
@@ -46,7 +54,7 @@ def _sync_series_fact(entry, tmdb_info, manual_done=False):
             k = facts.ep_key(sn, en)
             if k and en not in set(se.get('missing') or ()):
                 have.add(k)
-    cls = facts.classify(have, tmdb_info, manual_done=manual_done)
+    cls = facts.classify(have, info, manual_done=manual_done)
     payload = {
         'media_type': 'tv', 'tmdb_id': str(tid), 'matched': True,
         'series_ids': [str(x) for x in (entry.get('series_ids') or []) if x],
@@ -55,8 +63,8 @@ def _sync_series_fact(entry, tmdb_info, manual_done=False):
         'special': [], 'created': {},
         'in_local': bool(entry.get('in_local')), 'in_share': bool(entry.get('in_share')),
         'have_total': len(have),
-        'tmdb_total': (tmdb_info or {}).get('total_episodes') or 0,
-        'declared_total': (tmdb_info or {}).get('declared_total') or 0,
+        'tmdb_total': (info or {}).get('total_episodes') or 0,
+        'declared_total': (info or {}).get('declared_total') or 0,
         'classification': cls,
         'source_scan': 'mapping',
     }
@@ -503,8 +511,9 @@ def action_emby_library(args):
                 log.warning('TMDB 查询失败 %s: %s', tmdb_id, e); info = None; tmdb_errors += 1
             except Exception as e:
                 log.warning('TMDB 查询异常 %s: %s', tmdb_id, e); info = None; tmdb_errors += 1
-            manual_done = str(tmdb_id) in {str(k) for k in done}
-            # 原始 TMDB 响应 → facts.classify 用的 aired/total 形态（classify_series_by_tmdb 内部兼容两种）
+            # 复审修正：完结标记的键是 Emby 条目 id（tmdb_id 只是可能的一致键），双键位匹配
+            manual_done = facts.manual_done_for(done, s.get('series_ids'), tmdb_id)
+            # 原始 TMDB 响应 → normalize_tmdb_info 规整成 aired 集合（classify_series_by_tmdb 内部）
             s['tmdb_info'] = tmdb.classify_series_by_tmdb(s.get('seasons', []), info,
                                                           manual_done=manual_done)
             # S3：扫出的分集事实回写事实库 + 分类持久化（免二次查 Emby）
@@ -632,9 +641,26 @@ def build_morning_report(items: list, force_refresh: bool = False, cache_only: b
     data = {'now': now, 'rule_sig': snap.get('rule_sig') or '', 'items': items}
 
     if 'stats' in items:
-        # S5：到点现查。失败时把失败原因与旧缓存数据时间一起给渲染层，不静默用旧缓存。
-        fresh = ingest.refresh_ingest_cache(hours=24)
-        if not fresh.get('ok', True):
+        # S5：到点现查（定时发送/现场预览）。失败时把失败原因与旧缓存数据时间一起给
+        # 渲染层，不静默用旧缓存。
+        # 复审修正：cache_only=True（网页「预览（缓存）」）**只读轮询缓存不现查**——
+        # 8 万 STRM 级库上 refresh_ingest_cache 是一次全量 Emby 分页拉取，不能让
+        # 「预览（缓存）」变成页面卡死；缓存模式失败/无缓存时在块内明说数据来自缓存。
+        if cache_only:
+            cached = ingest.read_ingest_cache() or {}
+            if cached.get('ok', True) and cached.get('ts'):
+                fresh = cached
+                fresh['from_poll_cache'] = True
+            else:
+                data['ingest'] = {'error': '入库扫描失败：暂无入库缓存（预览（缓存）模式不现查，'
+                                          '请用「预览（现场扫）」或等待后台轮询）',
+                                  'stats': {}, 'rows': []}
+                fresh = None
+        else:
+            fresh = ingest.refresh_ingest_cache(hours=24)
+        if fresh is None:
+            pass                                    # cache_only 且无缓存：错误已写入 data['ingest']
+        elif not fresh.get('ok', True):
             old_ts = (ingest.read_ingest_cache() or {}).get('ts') or 0
             data['ingest'] = {
                 'error': '入库扫描失败：%s' % (fresh.get('error') or '未知原因'),
@@ -657,24 +683,32 @@ def build_morning_report(items: list, force_refresh: bool = False, cache_only: b
                     for name, ts in names.items():
                         rows.append((float(ts or 0), src, cat, name, 0))
             rows.sort(key=lambda x: -x[0])
+            stamp = '缓存 ' if fresh.get('from_poll_cache') else ''
             data['ingest'] = {'stats': st, 'rows': rows,
-                              'data_time': time.strftime('%H:%M', time.localtime(fresh.get('ts') or time.time()))}
+                              'data_time': stamp + time.strftime('%H:%M', time.localtime(fresh.get('ts') or time.time()))}
 
     if 'played' in items:
-        try:
-            rep = facts.recent_played_24h(hours=24)
-            if rep.get('errors') and not rep.get('records'):
-                data['played'] = {'error': '查询失败：%s' % '；'.join(rep['errors'][:3])}
-            else:
-                data['played'] = rep
-        except Exception as e:                       # EmbyFactError：块内显式失败
-            data['played'] = {'error': '查询失败：%s' % e}
+        if cache_only:
+            data['played'] = {'error': '预览（缓存）模式不现查播放记录，请用「预览（现场扫）」'}
+        else:
+            try:
+                rep = facts.recent_played_24h(hours=24)
+                if rep.get('errors') and not rep.get('records'):
+                    data['played'] = {'error': '查询失败：%s' % '；'.join(rep['errors'][:3])}
+                else:
+                    data['played'] = rep
+            except Exception as e:                   # EmbyFactError：块内显式失败
+                data['played'] = {'error': '查询失败：%s' % e}
 
     if 'subscriptions' in items:
-        try:
-            data['subs'] = _subs_updates_24h()
-        except Exception as e:
-            data['subs'] = {'error': str(e)}
+        if cache_only:
+            # 追更块无状态需要逐订阅现查事实；缓存预览不现查，明说
+            data['subs'] = {'error': '预览（缓存）模式不现查订阅事实，请用「预览（现场扫）」'}
+        else:
+            try:
+                data['subs'] = _subs_updates_24h()
+            except Exception as e:
+                data['subs'] = {'error': str(e)}
 
     if 'emby_gap' in items:
         try:
@@ -983,7 +1017,7 @@ def _refresh_tmdb_scan():
                 except Exception as e:
                     log.warning('TMDB 查询异常 %s: %s', tmdb_id, e)
                     info = None; tmdb_errors += 1
-                manual_done = str(tmdb_id) in {str(k) for k in done}
+                manual_done = facts.manual_done_for(done, s_.get('series_ids'), tmdb_id)
                 s_['tmdb_info'] = tmdb.classify_series_by_tmdb(s_.get('seasons', []), info,
                                                                manual_done=manual_done)
                 # S3：扫出的分集事实回写事实库 + 分类持久化（免二次查 Emby）

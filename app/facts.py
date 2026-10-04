@@ -20,7 +20,6 @@
 编排（S1 阶段消费方以薄封装逐步接入；S3 片库映射、S2 探索两段式建成后全量切换）：
 - ``get_series_status`` / ``get_movie_status``：取数 + classify + 落盘 + data_time，
   同一条事实**只写一次库**；
-- ``refresh_screen_facts``：屏幕内卡片并发重验（有界 ThreadPoolExecutor，不串行）。
 
 只依赖 state / emby / lib / tmdb / media / storage 等既有模块，不反向依赖业务模块。
 """
@@ -37,7 +36,7 @@ from . import state, emby, lib, storage, media
 log = logging.getLogger('media_agent')
 
 ITEMS_LIMIT = 50000          # 单次 /Items 上限（与 media.EP_LIMIT 同口径）
-SCREEN_WORKERS = 4           # refresh_screen_facts 的并发度（bot 更新处理同为 4 线程）
+# （S7 复审清理：refresh_screen_facts 已删——探索第二段/映射重验在 routers 内实现，避免死代码与并发口径分叉）
 
 
 class EmbyFactError(RuntimeError):
@@ -226,6 +225,10 @@ def series_episodes(series_ids):
             if en <= 0:
                 continue
             path = ep.get('Path') or ''
+            # 复审修正：幽灵分集过滤（与 media.live_episodes 同口径）——CD2 删源后
+            # Emby 异步刷新期间的残留条目不能当成「仍在库里」，否则追更与缺集少报。
+            if path and media.is_ghost(path):
+                continue
             lib_tag = state.emby_lib_of(path) if path else ''
             # 路径能归属到配置的库根才计入 local/share；映射不到库根（其它库/无路径）
             # 仍保留在 episodes 里——「存在这一集」是事实，只是归属未核实。
@@ -409,11 +412,30 @@ def _persist_fact(media_type, tmdb_id, payload, source='emby'):
             'source': row.get('source') or source}
 
 
-def get_series_status(tmdb_id, manual_done=False, tmdb_info=None, persist=True):
+def manual_done_for(done, series_ids, tmdb_id):
+    """手动完结标记匹配（复审修正：存储键是 Emby 条目 id，tmdb_id 只是可能的一致键）。
+
+    done 是 read_manual_done() 的 dict（Emby 条目 id → {name, ts}）；一部剧可能
+    以任一 Emby SeriesId 或 tmdb_id 被标记——任一命中即视为已标记。统一口径供
+    get_series_status / morning 扫描循环共用，杜绝「查表键位与写入键位不同」。
+    """
+    keys = {str(k) for k in (done or {})}
+    if not keys:
+        return False
+    if str(tmdb_id or '') in keys:
+        return True
+    return any(str(x) in keys for x in (series_ids or ()))
+
+
+def get_series_status(tmdb_id, manual_done=False, manual_done_set=None,
+                      tmdb_info=None, persist=True):
     """某剧当前事实：取数（find_series + series_episodes）+ classify + 落盘。
 
     - tmdb_info 可由调用方传入（同屏批量避免重复请求 TMDB）；
       缺省用 tmdb._tmdb_series_info（24h 库缓存）。
+    - 手动完结：manual_done_set 传 morning.read_manual_done() 的 dict 时，在拿到
+      Emby SeriesId 后用 manual_done_for 匹配（键位与写入端一致）；manual_done
+      布尔参数保留给调用方自己算好键位的场景。
     - 同一条事实**只写一次库**：分类结果合并进同一份 payload 一次写入
       （撤回版曾先写取数结果、classify 后再写一遍，双写浪费且可能读到中间态）。
     - Emby 取数失败抛 EmbyFactError；TMDB 查询失败由 _tmdb_series_info 返回 None
@@ -427,7 +449,8 @@ def get_series_status(tmdb_id, manual_done=False, tmdb_info=None, persist=True):
     except EmbyFactError:
         raise
     have = eps['episodes']
-    cls = classify(have, info, manual_done=manual_done)
+    md = bool(manual_done) or manual_done_for(manual_done_set, eps.get('series_ids'), tid)
+    cls = classify(have, info, manual_done=md)
     payload = {
         'media_type': 'tv', 'tmdb_id': tid, 'matched': bool(rows),
         'series_ids': eps['series_ids'], 'series_name': eps['series_name'],
@@ -455,38 +478,6 @@ def get_movie_status(tmdb_id, persist=True):
     return {'status': 'success', 'ok': True, 'fact': payload,
             'fact_key': saved['fact_key'], 'updated_at': saved['updated_at'],
             'data_time': time.strftime('%Y-%m-%d %H:%M', time.localtime(saved['updated_at']))}
-
-
-def refresh_screen_facts(items, persist=True):
-    """并发重验一屏卡片（§5.2 第二段）：items = [{'tmdb_id','type'|'media_type'}]。
-
-    有界 ThreadPoolExecutor（SCREEN_WORKERS），不串行（撤回版逐个同步请求，
-    一屏 20 张卡在 Emby 慢时要把用户晾十几秒）。单卡失败进该卡的 error 字段，
-    不拖垮整屏——但错误是显式的（'error': 原因），不是「未入库」。
-    """
-    jobs = []
-    for it in (items or []):
-        tid = str((it or {}).get('tmdb_id') or (it or {}).get('id') or '').strip()
-        mtype = str((it or {}).get('type') or (it or {}).get('media_type') or 'tv')
-        if tid:
-            jobs.append((tid, mtype))
-    if not jobs:
-        return []
-
-    def _one(job):
-        tid, mtype = job
-        try:
-            return get_movie_status(tid, persist=persist) if mtype == 'movie' else get_series_status(tid, persist=persist)
-        except EmbyFactError as e:
-            return {'status': 'error', 'ok': False, 'tmdb_id': tid, 'media_type': mtype,
-                    'error': str(e), 'reason': str(e)}
-        except Exception as e:                     # 编程错误也显式化，不让一张卡悄悄消失
-            log.warning('事实重验异常 %s: %s: %s', tid, type(e).__name__, e)
-            return {'status': 'error', 'ok': False, 'tmdb_id': tid, 'media_type': mtype,
-                    'error': str(e), 'reason': str(e)}
-
-    with ThreadPoolExecutor(max_workers=SCREEN_WORKERS) as pool:
-        return list(pool.map(_one, jobs))
 
 
 # ═══════════════════ 已看进度（S4 / D4，白皮书 §5.4） ═══════════════════
