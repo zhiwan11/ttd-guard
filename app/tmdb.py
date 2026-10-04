@@ -286,14 +286,6 @@ def _aired_per_season(tmdb_info):
             for s in (tmdb_info.get('seasons') or [])
             if s.get('season_number') is not None and int(s.get('season_number') or 0) > 0}
 
-def _emby_series_ids_by_tmdb(series_tmdb_id, fallback_id=None):
-    """按 TMDB ID 找 Emby Series 条目 ID 列表（薄包装 media.series_ids_by_tmdb）。
-
-    精确查询结果逐条校验 ProviderIds.Tmdb（服务端可能忽略 AnyProviderIdEquals 返回全库），
-    再回退全量清单 / fallback_id 兜底。前身实现见 media._series_items_by_tmdb。
-    """
-    return media.series_ids_by_tmdb(series_tmdb_id, fallback_id)
-
 def _emby_series_live_eps(series_tmdb_id, fallback_id=None, use_cache=True):
     """实时查某剧在 Emby 的分集集合（薄包装 media.series_live，不读任何快照）。
 

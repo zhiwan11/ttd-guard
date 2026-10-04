@@ -29,6 +29,8 @@ def api_get_subs():
         # （data_error），不用记账值冒充现状。S1 事实层建成后切换 facts.get_series_status。
         # 查不到分集不算失败：未入库是诚实的现状（前端显示「未入库」），
         # 只有 EmbyError（挂了 / Key 未配置 / 请求失败）才是白皮书 §5.4 修复3 的告警。
+        # S4（D4）：已看进度（手动值原样透出；生效值前端合并展示）
+        info['watched_ep_manual'] = s.get('watched_ep_manual') or ''
         tmdb_id = s.get('tmdb_id')
         if tmdb_id:
             try:
@@ -70,6 +72,8 @@ def api_save_subs(body: dict = None):
             'poster': str(s.get('poster') or ''),
             'enabled': bool(s.get('enabled', True)),
             'added_at': s.get('added_at') or time.strftime('%Y-%m-%d %H:%M:%S'),
+            # S4（D4）手动已看进度：'S01E15' 字符串；空串/缺省 = 未手动设置（用自动值）
+            'watched_ep_manual': str(s.get('watched_ep_manual') or '').strip(),
         })
     known = {s.get('id') for s in subscribe.get_subscriptions()}
     subscribe.set_subscriptions(clean)

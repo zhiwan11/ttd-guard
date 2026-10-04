@@ -12,7 +12,7 @@ from . import config as _cfg
 from . import logger
 from .core import (esc, parse_season_dir, get_ep, title_key, governance_title_key,
                    analyze_season_episodes, parse_emby_library, quality_label, RE_SXXEXX)
-from . import state, tmdb, emby, lib, storage, tg, media, sync
+from . import state, tmdb, emby, lib, storage, tg, media, sync, facts
 from .tgmsg import blocks as tgmsg_blocks, reports as tgmsg_reports
 
 log = logging.getLogger('media_agent')
@@ -58,25 +58,34 @@ def _load_subscription_report(today_only=False):
     return data
 
 def _emby_series_latest_ep(series_tmdb_id: str):
-    """查 Emby 里某剧（按 tmdb_id）的所有副本并 union 分集（薄包装 media.series_live）。
+    """查 Emby 里某剧（按 tmdb_id）的所有副本并 union 分集（S4 起走事实层取数）。
 
     同一剧可能同时存在本地/分享两个 Series 条目；对所有匹配 Series 聚合 (季,集)。
-    数据访问统一走 media（含 ProviderIds 校验与幽灵过滤），这里只把结果整理成
-    追更状态机需要的形状；追更要求「现查现报」，不走 15 秒微缓存；完全查不到分集时
-    返回 None，交由 _disk_series_eps 兜底。
+    数据访问统一走 facts（find_series 三层身份兜底 + series_episodes 展开与库归属，
+    含 ProviderIds 校验与幽灵过滤），这里只把结果整理成追更状态机需要的形状；
+    追更要求「现查现报」，不走 15 秒微缓存；完全查不到分集时返回 None，
+    交由 _disk_series_eps 兜底。
     """
-    live = media.series_live(series_tmdb_id, use_cache=False)
-    if not live or not live.get('episodes'):
+    rows = facts.find_series(series_tmdb_id)
+    if not rows:
         return None
-    have = set(live['episodes'])
-    created = live.get('created') or {}
+    eps = facts.series_episodes(rows)
+    have = _keys_to_eps(eps['episodes'])        # 'S01E02' 键 → (季,集) 元组（状态机口径）
+    if not have:
+        return None
+    created = eps.get('created') or {}
     sn, en = max(have)
+    created_pairs = {}
+    for k, v in created.items():
+        p = facts.parse_ep_key(k)
+        if p:
+            created_pairs[p] = v
     return {
-        'series_id': live.get('series_id'),
-        'series_ids': list(live.get('series_ids') or []),
-        'series_name': live.get('series_name') or '',
+        'series_id': (eps.get('series_ids') or [''])[0] or None,
+        'series_ids': list(eps.get('series_ids') or []),
+        'series_name': eps.get('series_name') or '',
         'season': sn, 'episode': en,
-        'date_created': created.get((sn, en), ''),
+        'date_created': created_pairs.get((sn, en), ''),
         'episodes': have,
     }
 
@@ -86,34 +95,21 @@ def _disk_series_eps(series_tmdb_id: str):
     上游 TgtoDrive 把 tmdb 写在目录名 `{tmdb-xxx}` 里，而 Emby 的刮削器不会把
     目录名里的 tmdb 后缀解析进 ProviderIds，导致 ``_emby_series_latest_ep`` 按
     ``ProviderIds.Tmdb`` 查不到 → 追更拿不到任何分集、「不能用」。
-    这里直接扫描两库磁盘，复用 lib.Lib 已经建好的 `tmdb_refs['tv:<id>']` 索引，
-    按目录名 tmdb 匹配并 union 分集。返回结构与 ``_emby_series_latest_ep`` 一致，
+    S4（P1-D）：改走 lib._disk_eps_by_tmdb 的磁盘事实直查（不走 media 的
+    库清单缓存，也不经 Emby）；返回结构与 ``_emby_series_latest_ep`` 一致，
     多一个 ``source='disk'`` 便于日志区分。
     """
     if not series_tmdb_id:
         return None
-    eps = set()
-    names = []
     try:
-        for disk_lib in (lib._get_lib(state.L_ROOT), lib._get_lib(state.S_ROOT)):
-            for key in disk_lib.tmdb_refs.get('tv:' + str(series_tmdb_id), ()):
-                disp = disk_lib.meta.get(key, ('', '', None))[0]
-                if disp and disp not in names:
-                    names.append(disp)
-                for sn, files in disk_lib.tv.get(key, {}).items():
-                    if sn <= 0:
-                        continue
-                    for f in files:
-                        try:
-                            ep = get_ep(f.name, f.parent.name, allow_bare_ep=True)
-                        except Exception:
-                            continue
-                        if ep and ep[0] > 0 and ep[1] > 0:
-                            eps.add(ep)
+        agg = lib._disk_eps_by_tmdb().get(str(series_tmdb_id))
     except Exception as e:
         log.warning('追更磁盘兜底扫描失败 %s: %s', series_tmdb_id, e)
-    if not eps:
+        agg = None
+    if not agg or not agg.get('episodes'):
         return None
+    eps = set(agg['episodes'])                 # {(季,集)}，与状态机口径一致
+    names = [agg.get('name') or ''] if agg.get('name') else []
     sn, en = max(eps)
     return {
         'series_id': None, 'series_ids': [],
@@ -218,7 +214,7 @@ def seed_new_subscriptions(subs: list) -> dict:
         try:
             # 与检查状态机同一条身份兜底链：Emby ProviderIds → 磁盘目录名 tmdb
             latest = _emby_series_latest_ep(tmdb_id) or _disk_series_eps(tmdb_id)
-        except emby.EmbyError as e:
+        except (emby.EmbyError, facts.EmbyFactError) as e:
             errors.append({'sid': sid, 'name': sub.get('name') or tmdb_id, 'message': str(e)})
             continue
         eps = (latest or {}).get('episodes') or set()
@@ -271,6 +267,8 @@ def _run_subscription_check(send_notify=True, self_delivered=False) -> dict:
     now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     # 记录每个订阅本轮「发送成功后应写回」的状态，发送前不落盘
     staged = {}
+    # S4：已看进度单轮缓存失效——一轮检查只查一次每个用户的播放记录
+    facts.invalidate_watch_cache()
 
     for sub in subs:
         if not sub.get('enabled', True): continue
@@ -280,7 +278,7 @@ def _run_subscription_check(send_notify=True, self_delivered=False) -> dict:
 
         try:
             latest = _emby_series_latest_ep(tmdb_id)
-        except emby.EmbyError as e:
+        except (emby.EmbyError, facts.EmbyFactError) as e:
             errors.append({'sid': sid, 'name': sub.get('name') or tmdb_id, 'message': str(e)})
             continue
         # Emby 的 ProviderIds.Tmdb 缺失（上游 TgtoDrive 目录名有 tmdb 但 Emby 没刮进去）
@@ -290,6 +288,14 @@ def _run_subscription_check(send_notify=True, self_delivered=False) -> dict:
         if not latest:
             latest = _disk_series_eps(tmdb_id)
         tmdb_info = tmdb._tmdb_series_info(tmdb_id) if check_tmdb else None
+        # S4（D4）：已看进度自动读 Emby 播放记录（单轮缓存）；查询失败只降级
+        # 为「自动值未知」，不冒充「没看过」，也不让整轮检查失败。
+        watch_auto = None
+        try:
+            watch_auto = (facts.watched_progress(tmdb_id) or {}).get('episode')
+        except (facts.EmbyFactError, emby.EmbyError) as e:
+            log.warning('已看进度读取失败 %s: %s', tmdb_id, e)
+        watched_ep = facts.effective_watched(sub.get('watched_ep_manual'), watch_auto)
         checked += 1
 
         # 无 Emby 数据且无 TMDB → 跳过（保持旧行为）
@@ -357,12 +363,23 @@ def _run_subscription_check(send_notify=True, self_delivered=False) -> dict:
         staged[sid] = st
 
         if has_change:
+            # S4（D4）通知规则：新增集里「超过已看进度」的才算「值得提醒」；
+            # 但全部新增仍记录在 new_eps 里不丢（记账不受影响）。
+            new_after_watch = (sorted(e for e in new_eps if not watched_ep or e > watched_ep)
+                               if new_eps else [])
             updates.append({
                 'sid': sid,
                 'name': (latest and latest.get('series_name')) or (tmdb_info and tmdb_info.get('name')) or sub.get('name'),
                 'tmdb_id': tmdb_id,
                 'poster': sub.get('poster', ''),
                 'new_eps': sorted(_eps_to_keys(new_eps)),
+                'new_after_watch': sorted(_eps_to_keys(new_after_watch)),
+                'worth_notifying': bool(new_after_watch or newly_missing or refilled),
+                'watched_ep': _ep_key(*watched_ep) if watched_ep else '',
+                'watched_source': 'manual' if (sub.get('watched_ep_manual')
+                                               and facts.effective_watched(sub.get('watched_ep_manual'), None)) else 'auto',
+                'total_eps': (tmdb_info or {}).get('declared_total') or (tmdb_info or {}).get('total_episodes') or 0,
+                'aired_total': (tmdb_info or {}).get('total_episodes') or 0,
                 'missing_eps': sorted(_eps_to_keys(missing_eps)),
                 'newly_missing': sorted(_eps_to_keys(newly_missing)),
                 'refilled': sorted(_eps_to_keys(refilled)),

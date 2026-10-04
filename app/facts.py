@@ -29,6 +29,7 @@ import re
 import time
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
+import threading
 
 from . import state, emby, lib, storage, media
 
@@ -485,6 +486,116 @@ def refresh_screen_facts(items, persist=True):
 
     with ThreadPoolExecutor(max_workers=SCREEN_WORKERS) as pool:
         return list(pool.map(_one, jobs))
+
+
+# ═══════════════════ 已看进度（S4 / D4，白皮书 §5.4） ═══════════════════
+
+WATCH_WORKERS = 4            # 逐用户播放记录查询的并发度
+WATCH_ROUND_TTL = 600        # 单轮结果缓存：一轮追更检查（或一次批量订阅）内复用
+
+_watch_cache = {}            # {'ts': float, 'data': {tmdb_id: {'episode':(sn,en),'date_played':...,'user':...} | None}}
+_watch_lock = threading.Lock()
+
+
+def invalidate_watch_cache():
+    """单轮缓存失效：新一轮批量检查开始时调用（避免跨轮使用陈旧播放记录）。"""
+    with _watch_lock:
+        _watch_cache.clear()
+
+
+def _user_episode_watched(uid, series_ids):
+    """某用户在这些 Emby Series 里看过（IsPlayed）的最高 (季, 集)。"""
+    data = emby.emby_request('/Users/%s/Items' % uid, {
+        'Recursive': 'true', 'IncludeItemTypes': 'Episode', 'Filters': 'IsPlayed',
+        'Fields': 'ParentIndexNumber,IndexNumber,DatePlayed,SeriesId',
+        'SortBy': 'DatePlayed', 'SortOrder': 'Descending', 'Limit': ITEMS_LIMIT,
+    }) or {}
+    best = None
+    for it in (data.get('Items') or []):
+        if str(it.get('SeriesId') or '') not in series_ids:
+            continue
+        try:
+            pair = (int(it.get('ParentIndexNumber') or 0), int(it.get('IndexNumber') or 0))
+        except (TypeError, ValueError):
+            continue
+        if pair[0] <= 0 or pair[1] <= 0:
+            continue
+        if best is None or pair > best['episode']:
+            best = {'episode': pair, 'date_played': it.get('DatePlayed') or ''}
+    return best
+
+
+def watched_progress(tmdb_id, use_round_cache=True):
+    """某剧的「已看进度」（自动来源）：所有 Emby 用户播放记录里的最高已播集。
+
+    - 有界并发（WATCH_WORKERS）：逐用户 /Users/{uid}/Items IsPlayed 现查；
+      **单轮结果缓存**（WATCH_ROUND_TTL）：一轮批量里多个订阅/重复查询不打 Emby——
+      规避撤回版「每订阅每轮都全量查 /Users」把 Emby 打挂的坑；
+    - 没有任何用户的播放记录 → None（诚实：没看过 ≠ 查不到）；
+    - Emby 请求失败 → EmbyFactError（与事实层同口径，不冒充「没看过」）。
+    """
+    tid = str(tmdb_id or '').strip()
+    if not tid:
+        return None
+    if use_round_cache:
+        with _watch_lock:
+            hit = _watch_cache.get(tid)
+            if hit and time.time() - hit[0] < WATCH_ROUND_TTL:
+                return hit[1]
+    try:
+        rows = find_series(tid)
+    except EmbyFactError:
+        raise
+    series_ids = {str(r.get('Id')) for r in rows if r.get('Id')}
+    if not series_ids:
+        result = None
+    else:
+        try:
+            users = emby.emby_request('/Users', {'Limit': 500}) or []
+        except Exception as e:
+            raise EmbyFactError('Emby 用户清单查询失败: %s' % e) from e
+
+        def _one(u):
+            uid = (u or {}).get('Id')
+            if not uid:
+                return None
+            try:
+                return _user_episode_watched(uid, series_ids)
+            except Exception as e:
+                raise EmbyFactError('Emby 播放记录查询失败（用户 %s）: %s' % (u.get('Name') or uid, e)) from e
+
+        with ThreadPoolExecutor(max_workers=WATCH_WORKERS) as pool:
+            per_user = list(pool.map(_one, users))
+        best = None
+        for r in per_user:
+            if r and (best is None or r['episode'] > best['episode']):
+                best = r
+        result = best
+    if use_round_cache:
+        with _watch_lock:
+            _watch_cache[tid] = (time.time(), result)
+    return result
+
+
+def effective_watched(manual_value, auto_value):
+    """D4 并用、手动优先：生效已看 = 手动值（非空）否则自动值。
+
+    manual_value 是订阅里的 ``watched_ep_manual``（'S01E15' 或 (1,15)）；手动值
+    解析不了（格式坏）也回退自动值——手填错了不能把通知整个弄哑。
+    返回 (季, 集) 元组或 None。
+    """
+    manual = None
+    if isinstance(manual_value, str):
+        manual = parse_ep_key(manual_value)
+    elif isinstance(manual_value, (tuple, list)) and len(manual_value) == 2:
+        try:
+            p = (int(manual_value[0]), int(manual_value[1]))
+            manual = p if p[0] > 0 and p[1] > 0 else None
+        except (TypeError, ValueError):
+            manual = None
+    if manual:
+        return manual
+    return auto_value
 
 
 # ═══════════════════ 读回（供 S2/S3 切换时使用；payload 往返保持键形态） ═══════════════════

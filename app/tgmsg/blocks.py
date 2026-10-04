@@ -173,6 +173,35 @@ def sub_updates_lines(updates, style='notify', limit=None):
     for u in passed:
         lines.append(th.Html(''))
         lines.append(th.Html('📺 <b>《%s》</b>' % th.h(u.get('name') or '')))
+        if u.get('watched_ep'):
+            # S4（A6，§5.4）：「你已看到 Exx，新入库 Exx–Exx（共 N 集，已播 M）」
+            watched = u['watched_ep']
+            m = re.match(r'S(\d+)E(\d+)$', watched)
+            seen = ('S%02dE%02d' % (int(m.group(1)), int(m.group(2)))) if m else watched
+            parts = ['　👀 你已看到 <b>%s</b>' % seen]
+            if u.get('new_after_watch'):
+                parts.append('新入库 <b>%s</b>' % ep_ranges(keys_to_eps(u['new_after_watch'])))
+            elif u.get('new_eps'):
+                # 有新增但都不超过已看进度：仍如实报，不加「新入库」诱导
+                parts.append('新增 <b>%s</b>（都不超过已看进度）'
+                             % ep_ranges(keys_to_eps(u['new_eps'])))
+            tail = []
+            if u.get('total_eps'):
+                tail.append('共 %d 集' % int(u['total_eps']))
+            if u.get('aired_total'):
+                tail.append('已播 %d' % int(u['aired_total']))
+            if tail:
+                parts.append('（%s）' % '，'.join(tail))
+            lines.append(th.Html('，'.join(p.rstrip('，') for p in parts)))
+        elif u.get('total_eps') or u.get('aired_total'):
+            # 没有任何已看记录（新剧/没开看）：仍给上下文总数
+            tail = []
+            if u.get('total_eps'):
+                tail.append('共 %d 集' % int(u['total_eps']))
+            if u.get('aired_total'):
+                tail.append('已播 %d' % int(u['aired_total']))
+            if tail:
+                lines.append(th.Html('　👀 暂无播放记录（%s）' % '，'.join(tail)))
         if u.get('refilled'):
             lines.append(th.Html('　✅ 已补齐 <b>%s</b>' % ep_ranges(keys_to_eps(u['refilled']))))
         if u.get('new_eps'):

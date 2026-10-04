@@ -4323,11 +4323,20 @@ async function loadSubscriptions(){
         var notified = s.notified_ep
           ? '<div style="font-size:11px;color:#9ca3af;margin-top:2px">已通知到 ' + esc(s.notified_ep) + (s.updated_at ? ' · ' + esc(s.updated_at) : '') + '</div>'
           : '';
+        /* S4（D4）：已看进度——手动值优先展示并标注「手动」，否则按自动读取展示 */
+        var watched = '';
+        if (s.watched_ep_manual) {
+          watched = '<div style="font-size:11px;color:#6366f1;margin-top:2px">👀 已看到 ' + esc(s.watched_ep_manual) + '（手动）'
+                  + ' <button class="btn sm gray" style="padding:0 6px;font-size:10px" onclick="editWatchedEp(' + i + ')">改</button></div>';
+        } else if (s.notified_ep) {
+          watched = '<div style="font-size:11px;color:#9ca3af;margin-top:2px">👀 已看进度未设置，自动读取播放记录'
+                  + ' <button class="btn sm gray" style="padding:0 6px;font-size:10px" onclick="editWatchedEp(' + i + ')">手动填</button></div>';
+        }
         return '<div class="sub-item">'
           + '<div class="p">' + poster + '</div>'
           + '<div class="body">'
           + '<div class="name">' + esc(s.name) + '</div>'
-          + live + notified
+          + live + notified + watched
           + '</div>'
           + '<div class="actions">'
           + '<button class="btn sm ' + (s.enabled ? 'green' : 'gray') + '" onclick="toggleSubEnabled(' + i + ')">' + (s.enabled ? '启用' : '暂停') + '</button>'
@@ -4363,6 +4372,21 @@ async function removeSub(i){
   try {
     var r = await api('/api/subscriptions', { method: 'POST', body: JSON.stringify({ subscriptions: currentSubs }) });
     if (r.warning) toast(r.warning, 'error', 5000);
+    loadSubscriptions();
+  } catch(e){ toast(e.message, 'error'); }
+}
+/* S4（D4）：手动填已看进度（来源 B）；留空清除手动值（回退自动读取） */
+async function editWatchedEp(i){
+  var s = currentSubs[i];
+  var v = prompt('手动设置《' + s.name + '》的已看进度（如 S01E15；留空恢复自动读取）：', s.watched_ep_manual || '');
+  if (v === null) return;
+  v = v.trim().toUpperCase();
+  if (v && !/^S\d+E\d+$/.test(v)) { toast('格式应为 SxxExx，如 S01E15', 'error'); return; }
+  s.watched_ep_manual = v;
+  try {
+    var r = await api('/api/subscriptions', { method: 'POST', body: JSON.stringify({ subscriptions: currentSubs }) });
+    if (r.warning) toast(r.warning, 'error', 5000);
+    toast(v ? ('已设置已看进度 ' + v) : '已清除手动已看进度', 'success');
     loadSubscriptions();
   } catch(e){ toast(e.message, 'error'); }
 }

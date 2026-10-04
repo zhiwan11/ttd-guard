@@ -12,7 +12,7 @@ from . import config as _cfg
 from . import logger
 from .core import (md_esc, parse_season_dir, get_ep, title_key, governance_title_key,
                    analyze_season_episodes, parse_emby_library, quality_label, RE_SXXEXX)
-from . import state, governance, morning, emby, lib, storage
+from . import state, governance, morning, emby, lib, storage, subscribe
 
 log = logging.getLogger('media_agent')
 
@@ -147,6 +147,7 @@ def refresh_ingest_cache(hours=24) -> dict:
     """立即拉取并覆盖缓存。拉取失败（超时等）时保留上一份完整缓存，只附上失败信息，
     避免把「+0 部 / +0 集」的残缺结果写成最新数据。"""
     log.info('入库缓存刷新开始（%sh）', hours)
+    _old_ing = read_ingest_cache()
     data = _fetch_ingest(hours=hours)
     if not data.get('ok', True):
         old = read_ingest_cache()
@@ -167,6 +168,23 @@ def refresh_ingest_cache(hours=24) -> dict:
             morning.refresh_mapping_cache_after_ingest(data)
         except Exception as e:
             log.warning('入库后片库映射缓存刷新失败: %s', e)
+        # S4（§5.4）：入库轮询发现订阅剧有新集 → 立即触发一次追更检查（缩短延迟）。
+        # 用 24h 剧集入库**明细签名**比较，而不是「集数总和」：同一窗口里
+        # 「入库 3 集、又洗版删掉 1 集」总数不变但明细变了——只比总数会把这次
+        # 变化漏掉；反过来「总数没变、集号换了一批」也一样。签名含最近入库时间，
+        # 连「同名重入库」（文件被替换、时间戳变了）都能抓到。
+        try:
+            affected = _tv_sig_affected_subscriptions(data, _old_ing)
+            if affected is None:
+                pass                    # 签名无变化 → 跳过，不打扰 _CHECK_LOCK
+            elif affected:
+                log.info('入库签名变化，触发受影响订阅的追更检查：%s', sorted(affected)[:10])
+                subscribe.check_subscriptions(send_notify=True)
+            else:
+                # 签名变了但入库的剧都不在订阅里 → 跳过（白皮书：受影响集合为空则跳过）
+                log.info('入库签名变化，但无受影响订阅，跳过追更检查')
+        except Exception as e:
+            log.warning('入库后追更即时检查失败: %s', e)
     st = data.get('stats', {})
     if not data.get('ok', True):
         log.warning('入库缓存刷新失败且无旧缓存可保留: %s', data.get('error'))
@@ -174,6 +192,46 @@ def refresh_ingest_cache(hours=24) -> dict:
     log.info('入库缓存刷新完成：电影 %d / 剧集 %d 部 / 集 %d',
              st.get('movies', 0), st.get('series', 0), st.get('episodes', 0))
     return data
+
+
+def _tv_sig(d):
+    """24h 剧集入库明细签名：{(库, 分类, 剧名, 集数, 最近入库时间)}（撤回版设计）。"""
+    out = set()
+    try:
+        for src, cats in ((d.get('tree') or {}).get('tv_detail') or {}).items():
+            for cat, shows in (cats or {}).items():
+                for name, info in (shows or {}).items():
+                    out.add((src, cat, name, int((info or {}).get('count') or 0),
+                             float((info or {}).get('last_ts') or 0)))
+    except Exception:
+        pass
+    return out
+
+
+def _tv_sig_affected_subscriptions(new_data, old_data):
+    """签名变化检测 → 受影响的订阅剧名集合。
+
+    返回 None 表示签名无变化（不触发）；返回 set() 表示有变化但无受影响订阅；
+    返回非空 set（剧名，casefold）表示有受影响订阅，调用方触发一轮检查
+    （check_subscriptions 自身会按订阅逐个现查，只对有变化的剧发通知）。
+    """
+    new_sig, old_sig = _tv_sig(new_data), _tv_sig(old_data or {})
+    if new_sig == old_sig:
+        return None
+    changed_titles = {(name or '').casefold() for (_src, _cat, name, _c, _ts) in (new_sig - old_sig)}
+    if not changed_titles:
+        return set()
+    subscribed = set()
+    try:
+        for s in subscribe.get_subscriptions():
+            if not s.get('enabled', True):
+                continue
+            nm = lib._normalize_title(str(s.get('name') or '')).casefold()
+            if nm and nm in changed_titles:
+                subscribed.add(nm)
+    except Exception as e:
+        log.warning('受影响订阅匹配失败: %s', e)
+    return subscribed
 
 def _write_ingest_cache(data):
     """入库缓存（SQLite 文档 ingest_cache，年龄看内嵌的 ts）"""
