@@ -332,8 +332,12 @@ def _dim_release_group(name):
     return m.group(1) if m else ''
 
 
+@lru_cache(maxsize=8192)
 def recognize_dims(name):
-    """从文件名识别各维度档位标签（所有比较的唯一输入）。"""
+    """从文件名识别各维度档位标签（所有比较的唯一输入）。
+
+    结果为共享缓存对象，调用方只读不得修改。
+    """
     return {
         'source': _dim_source(name),
         'resolution': _dim_resolution(name),

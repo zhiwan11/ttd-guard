@@ -110,6 +110,11 @@ def is_masked_value(v: str) -> bool:
 # 以前每次都读盘 + 解析 JSON，8 万个 STRM 就是 8 万次读盘，是扫描慢的主因之一。
 _CFG_CACHE = {'sig': None, 'data': None}
 
+# 画质对比规则的规范化结果缓存：双库比较每对版本都要取一次规则，
+# 按同一文件签名缓存 normalize_cover / cover_default_strategy 的结果，
+# 避免每次重新 json.loads + 规范化。失效语义与 _CFG_CACHE 完全一致。
+_COVER_STRATEGY_CACHE = {'sig': None, 'data': None}
+
 
 def _cfg_signature():
     try:
@@ -152,6 +157,7 @@ def save_config(cfg: dict) -> dict:
     tmp.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding='utf-8')
     tmp.replace(CONFIG_FILE)
     _CFG_CACHE['data'] = None  # 落盘后强制下次重新读取
+    _COVER_STRATEGY_CACHE['data'] = None  # 画质对比规则同步失效，保证 Web 保存后立即生效
     return clean
 
 
@@ -307,15 +313,27 @@ def get_ingest_cfg() -> dict:
 
 # ═══════════ 画质对比规则（7 维；双库治理比较版本的唯一依据） ═══════════
 def get_cover_strategy() -> dict:
-    """读取画质对比规则；无配置/解析失败时回退默认，并规范成完整 8 条。"""
+    """读取画质对比规则；无配置/解析失败时回退默认，并规范成完整 8 条。
+
+    按配置文件签名缓存，保存后立即生效。
+    """
+    sig = _cfg_signature()
+    if _COVER_STRATEGY_CACHE['data'] is not None and _COVER_STRATEGY_CACHE['sig'] == sig:
+        return _COVER_STRATEGY_CACHE['data']
     raw = load_config().get('strategy_cover') or ''
     try:
         data = json.loads(raw) if raw else None
     except (ValueError, TypeError):
         data = None
     if isinstance(data, dict) and isinstance(data.get('rules'), list) and data['rules']:
-        return _core.normalize_cover(data)
-    return _core.cover_default_strategy()
+        out = _core.normalize_cover(data)
+    else:
+        out = _core.cover_default_strategy()
+    # 配置文件不存在（sig 为 None）时同样缓存默认策略：
+    # 用 data 是否为 None 区分「无缓存」与「sig=None 的已缓存默认值」。
+    _COVER_STRATEGY_CACHE['sig'] = sig
+    _COVER_STRATEGY_CACHE['data'] = out
+    return out
 
 
 def update_cover_strategy(strategy: dict) -> dict:
