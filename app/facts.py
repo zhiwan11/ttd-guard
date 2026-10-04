@@ -29,6 +29,7 @@ import re
 import time
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
+import datetime
 import threading
 
 from . import state, emby, lib, storage, media
@@ -596,6 +597,84 @@ def effective_watched(manual_value, auto_value):
     if manual:
         return manual
     return auto_value
+
+
+# ═══════════════════ 近 24h 播放记录（S5 / D7，白皮书 §5.5） ═══════════════════
+
+PLAYED_LIMIT = 50           # 晨报最多列出 50 条播放记录
+PLAYED_WORKERS = 4          # 逐用户并发
+
+
+def recent_played_24h(hours=24):
+    """近 N 小时全部用户的已播分集/电影记录（晨报「近 24 小时播放」块）。
+
+    - 逐用户 /Users/{uid}/Items IsPlayed、DatePlayed 倒序；每用户**越过窗口即
+      break**（倒序拉取，一旦遇到窗口外的记录，后面只会更旧）；再截 PLAYED_LIMIT 条；
+    - 有界 ThreadPoolExecutor 并发（PLAYED_WORKERS）；
+    - 单个用户查询失败：记入返回的 errors（晨报块内显式「⚠️ 查询失败：原因」），
+      不拖垮其它用户的记录；Emby 整体不可达（/Users 失败）抛 EmbyFactError。
+    返回 {'records': [...], 'errors': [...]}，record 含
+    user/type/name/season/episode/date_played/ts。
+    """
+    cutoff = time.time() - float(hours) * 3600
+    try:
+        users = emby.emby_request('/Users', {'Limit': 500}) or []
+    except Exception as e:
+        raise EmbyFactError('Emby 用户清单查询失败: %s' % e) from e
+    errors, records = [], []
+
+    def _one(u):
+        uid = (u or {}).get('Id')
+        who = (u or {}).get('Name') or '用户'
+        if not uid:
+            return []
+        try:
+            data = emby.emby_request('/Users/%s/Items' % uid, {
+                'Recursive': 'true', 'Filters': 'IsPlayed',
+                'Fields': 'ParentIndexNumber,IndexNumber,DatePlayed,Path,ProductionYear',
+                'SortBy': 'DatePlayed', 'SortOrder': 'Descending', 'Limit': ITEMS_LIMIT,
+            }) or {}
+        except Exception as e:
+            errors.append('用户 %s：查询失败 %s' % (who, e))
+            return []
+        out = []
+        for it in (data.get('Items') or []):
+            dp = _parse_emby_dt(it.get('DatePlayed'))
+            if dp is None:
+                continue
+            if dp < cutoff:
+                break                       # 倒序：越过 24h 即 break
+            if (it.get('Type') or '') == 'Movie':
+                out.append({'user': who, 'type': 'movie', 'name': it.get('Name') or '',
+                            'date_played': it.get('DatePlayed') or '', 'ts': dp})
+            else:
+                try:
+                    sn = int(it.get('ParentIndexNumber') or 0)
+                    en = int(it.get('IndexNumber') or 0)
+                except (TypeError, ValueError):
+                    sn = en = 0
+                out.append({'user': who, 'type': 'tv', 'name': it.get('SeriesName') or '',
+                            'season': sn, 'episode': en,
+                            'date_played': it.get('DatePlayed') or '', 'ts': dp})
+        return out
+
+    with ThreadPoolExecutor(max_workers=PLAYED_WORKERS) as pool:
+        for rows in pool.map(_one, users):
+            records.extend(rows)
+    records.sort(key=lambda x: -x.get('ts') or 0)
+    return {'records': records[:PLAYED_LIMIT], 'errors': errors,
+            'total': len(records)}
+
+
+def _parse_emby_dt(s):
+    """Emby 的 DatePlayed/DateCreated（ISO 字符串）→ epoch 秒；解析不了返回 None。"""
+    if not s:
+        return None
+    try:
+        return datetime.datetime.strptime(str(s)[:19], '%Y-%m-%dT%H:%M:%S') \
+            .replace(tzinfo=datetime.timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return None
 
 
 # ═══════════════════ 读回（供 S2/S3 切换时使用；payload 往返保持键形态） ═══════════════════

@@ -50,7 +50,8 @@ DEFAULTS = {
     'morning_report_enabled':    '0',
     'morning_report_hour':       '9',
     'morning_report_minute':     '0',
-    'morning_report_items':      'stats,subscriptions,emby_gap',
+    'morning_report_items':      'stats,played,subscriptions,emby_gap',   # S5：默认加播放块（D7）
+    'morning_gap_include_lagging': '0',  # D3：晨报缺集榜默认不含「在更·落后」，可切换
     'morning_report_last_date':  '',
     'morning_prescan_min':       '5',   # 提前 N 分钟后台静默预热
     'morning_prescan_last_date': '',    # 内部

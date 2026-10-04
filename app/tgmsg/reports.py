@@ -242,14 +242,15 @@ def sub_list(subs, sub_state):
 
 # ═══════════════════ 晨报 ═══════════════════
 def morning_report(data):
-    """晨报渲染器。``data`` 由 morning.build_morning_report 采集：
+    """晨报渲染器。``data`` 由 morning.build_morning_report 采集（S5 四块）：
 
       now         : datetime（标题日期）
       rule_sig    : 统一快照规则指纹
-      items       : ['stats', 'subscriptions', 'emby_gap'] 子集
-      ingest      : {'stats', 'rows'} 或 {'error'}
-      subs        : updates 列表 或 {'error'}
-      gap         : gap_report 结果 或 {'error'}
+      items       : ['stats', 'played', 'subscriptions', 'emby_gap'] 子集
+      ingest      : {'stats', 'rows', 'data_time'} 或 {'error', 'old_data_time'}
+      played      : {'records', 'errors'} 或 {'error'}（近 24h 播放，D7）
+      subs        : updates 列表 或 {'error'}（无状态：24h 内 DateCreated 计数）
+      gap         : gap_report 结果（带 data_time/prescan_fallback）或 {'error', 'old_data_time'}
     """
     items = data.get('items') or []
     now = data['now']
@@ -260,10 +261,15 @@ def morning_report(data):
     if 'stats' in items:
         ing = data.get('ingest') or {}
         if ing.get('error'):
-            lines += ['', '📊 入库统计失败: %s' % th.h(ing['error'])]
+            # S5（§5.5）：到点现查失败 → 明说「入库扫描失败：原因」，不拿旧缓存冒充；
+            # 有旧缓存时附「（上次成功数据 HH:MM）」作诚实标注。
+            tail = ('（上次成功数据 %s）' % ing['old_data_time']) if ing.get('old_data_time') else ''
+            lines += ['', '📊 <b>近 24 小时入库</b>',
+                      '⚠️ 入库扫描失败：%s%s' % (th.h(ing['error']), tail)]
         else:
             st = ing.get('stats') or {}
-            lines += ['', '📊 <b>近 24 小时入库</b>',
+            stamp = ('　<i>数据 %s</i>' % ing['data_time']) if ing.get('data_time') else ''
+            lines += ['', '📊 <b>近 24 小时入库</b>%s' % stamp,
                       '🎬 电影　<b>+%s</b> 部' % st.get('movies', 0),
                       '📺 剧集　<b>+%s</b> 部 · <b>+%s</b> 集' % (st.get('series', 0), st.get('episodes', 0))]
             rows = ing.get('rows') or []
@@ -275,24 +281,54 @@ def morning_report(data):
                 if len(rows) > len(det):
                     lines.append('<i>…另有 %d 条，完整清单见 Web「每日简报」</i>' % (len(rows) - len(det)))
 
+    if 'played' in items:
+        rep = data.get('played') or {}
+        if rep.get('error'):
+            lines += ['', '👤 <b>近 24 小时播放</b>', '⚠️ %s' % th.h(rep['error'])]
+        else:
+            recs = rep.get('records') or []
+            errs = rep.get('errors') or []
+            lines += ['', '👤 <b>近 24 小时播放</b>　<i>%d 条</i>' % len(recs)]
+            if recs:
+                det = []
+                for r in recs[:20]:
+                    if r.get('type') == 'movie':
+                        det.append(th.Html('🎬《%s》—— %s' % (th.h(r.get('name')), th.h(r.get('user')))))
+                    else:
+                        det.append(th.Html('📺《%s》S%02dE%02d —— %s'
+                                           % (th.h(r.get('name')), r.get('season') or 0,
+                                              r.get('episode') or 0, th.h(r.get('user')))))
+                lines.append(str(th.bq(det)))
+                if len(recs) > 20:
+                    lines.append('<i>…另有 %d 条</i>' % (len(recs) - 20))
+            else:
+                lines.append('✅ 暂无播放记录')
+            if errs:
+                lines.append(th.Html('⚠️ 部分用户查询失败：%s' % th.h('；'.join(errs[:3]))))
+
     if 'subscriptions' in items:
         subs = data.get('subs')
         if isinstance(subs, dict) and subs.get('error'):
-            lines += ['', '🔔 订阅汇报读取失败: %s' % th.h(subs['error'])]
+            lines += ['', '🔔 <b>订阅更新</b>', '⚠️ %s' % th.h(subs['error'])]
         else:
             lines += [''] + [str(x) for x in blocks.sub_updates_lines(subs or [], 'morning', limit=10)]
 
     if 'emby_gap' in items:
         gap = data.get('gap') or {}
         if gap.get('error'):
-            lines += ['', '🧩 Emby 检查失败: %s' % th.h(gap['error'])]
+            # S5（§5.5）：预扫失败 → 明写「缺集榜：预扫失败，数据来自 HH:MM」；
+            # 无旧数据时只给失败原因，不虚构时间。
+            tail = ('，数据来自 %s' % gap['old_data_time']) if gap.get('old_data_time') else ''
+            lines += ['', '🧩 <b>缺集榜</b>　<i>预扫失败%s</i>' % th.h(tail),
+                      '⚠️ %s' % th.h(gap['error'])]
         elif gap.get('status') == 'empty':
-            lines += ['', '🧩 <b>Emby 缺集</b>　<i>%s</i>' % th.h(gap.get('message') or '暂无缓存')]
+            lines += ['', '🧩 <b>缺集榜</b>　<i>%s</i>' % th.h(gap.get('message') or '暂无缓存')]
             return th.Html('\n'.join(lines))
         else:
             broken = gap.get('missing') or []
-            lines += ['', '🧩 <b>Emby 缺集</b>　<i>%d 部 · 共缺 %d 集</i>'
-                      % (len(broken), sum(blocks._diff(x) for x in broken))]
+            stamp = ('　<i>数据时间 %s</i>' % gap['data_time']) if gap.get('data_time') else ''
+            lines += ['', '🧩 <b>缺集榜</b>　<i>%d 部 · 共缺 %d 集%s</i>'
+                      % (len(broken), sum(blocks._diff(x) for x in broken), stamp)]
             if broken:
                 shown = blocks.gap_list(broken, top=MORNING_GAP_TOP)
                 lines.append(str(th.bq(shown)))

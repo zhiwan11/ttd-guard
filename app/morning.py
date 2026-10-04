@@ -454,6 +454,10 @@ def daily_consistency_snapshot(force_refresh: bool = False) -> dict:
         'rules': rule_snapshot['rules'],
     }
 
+def gap_include_lagging() -> bool:
+    """D3 设置项：晨报「缺集榜」是否包含「在更·落后」档（默认不含，可切换）。"""
+    return (_cfg.load_config().get('morning_gap_include_lagging') or '0') == '1'
+
 def gap_report(max_age=30 * 60, force_refresh=False, cache_only=False):
     """缺集检测统一口径。
 
@@ -486,7 +490,12 @@ def gap_report(max_age=30 * 60, force_refresh=False, cache_only=False):
     for s_ in series:
         st = _cn_status((s_.get('tmdb_info') or {}).get('match_status', 'unmatched'))
         if (b := _stat_bucket(st)) in stats: stats[b] += 1
-        if st == 'missing': missing.append(s_)
+        if st == 'missing':
+            missing.append(s_)
+        elif st == 'ongoing_lagging' and gap_include_lagging():
+            # D3：在更·落后单独一档；晨报缺集榜默认不含，设置项 morning_gap_include_lagging
+            # 可切换（切开后并入缺集榜，按缺得最多排序）。
+            missing.append(s_)
     missing.sort(key=lambda x: (x.get('tmdb_info') or {}).get('diff') or 0)  # diff 为负，越小缺得越多
     for s_ in missing:
         # S3（§5.3）：缺集榜带精确集号区间（tmdb_info.missing_ranges 由 facts.classify 产出）
@@ -597,19 +606,83 @@ def action_emby_library(args):
             log.warning('保存统一片库对照缓存失败: %s', e)
     return result
 
+def _subs_updates_24h():
+    """S5（§5.5 表第 3 行）：追更更新块——**无状态**，不再依赖「当天是否推送过」。
+
+    逐订阅 facts.get_series_status 现查事实，数 payload.created 里 DateCreated
+    落在 24h 内的集（键是 'S01E02' 字符串——JSON 往返安全，与撤回版元组键 bug 相反
+    的方向，由回归用例锁死）。取数失败的订阅聚合为 {'error': 'N 部检查失败: ...'}，
+    不让一部失败把整块抹掉。
+    """
+    cutoff = time.time() - 24 * 3600
+    updates, fail = [], []
+    for sub in subscribe.get_subscriptions():
+        if not sub.get('enabled', True):
+            continue
+        tid = sub.get('tmdb_id')
+        if not tid:
+            continue
+        try:
+            out = facts.get_series_status(tid)
+        except Exception as e:                      # EmbyFactError 及意外都聚合
+            fail.append('《%s》%s' % (sub.get('name') or tid, e))
+            continue
+        fact = out.get('fact') or {}
+        created = fact.get('created') or {}
+        new_eps = []
+        for k, date_s in created.items():
+            ts = facts._parse_emby_dt(date_s)
+            if ts is not None and ts >= cutoff:
+                new_eps.append(k)
+        if not new_eps:
+            continue
+        cls = out.get('classification') or {}
+        updates.append({
+            'sid': sub.get('id') or tid,
+            'name': fact.get('series_name') or sub.get('name') or tid,
+            'tmdb_id': tid,
+            'poster': sub.get('poster', ''),
+            'new_eps': sorted(new_eps),
+            'newly_missing': [], 'refilled': [], 'new_after_watch': [],
+            'watched_ep': '', 'worth_notifying': True,
+            'total_eps': fact.get('declared_total') or 0,
+            'aired_total': fact.get('tmdb_total') or 0,
+            'missing_eps': cls.get('missing') or [],
+            'newly_missing_ranges': cls.get('missing_ranges') or '',
+        })
+    if fail:
+        return {'error': '%d 部检查失败：%s' % (len(fail), '；'.join(fail[:5]))}
+    return updates
+
+
 def build_morning_report(items: list, force_refresh: bool = False, cache_only: bool = False) -> str:
-    """采集晨报所需数据，交给 tgmsg.reports.morning_report 统一渲染（拆数据与排版）。"""
+    """采集晨报所需数据，交给 tgmsg.reports.morning_report 统一渲染（拆数据与排版）。
+
+    S5 四块（§5.5）：
+      stats       近 24h 入库 —— **到点现查** refresh_ingest_cache(hours=24)，
+                  失败写「入库扫描失败：原因」并附旧数据时间，不拿轮询缓存冒充；
+      played      近 24h 播放（D7）—— facts.recent_played_24h；
+      subscriptions 追更更新 —— 无状态（_subs_updates_24h）；
+      emby_gap    缺集榜 —— 事实层/对照缓存 + 数据时间；预扫失败明写「数据来自 HH:MM」。
+    """
     now = datetime.datetime.fromtimestamp(time.time())
     snap = daily_consistency_snapshot(force_refresh=force_refresh)
     items = list(items or [])
     data = {'now': now, 'rule_sig': snap.get('rule_sig') or '', 'items': items}
 
     if 'stats' in items:
-        try:
-            st = (snap.get('ingest') or {}).get('stats') or {}
-            # 折叠明细（对齐 Web 入库汇报）：最近入库置顶，TG 里点开即看，不用回 Web
-            ing = ingest.read_ingest_cache() or {}
-            tree = ing.get('tree') or {}
+        # S5：到点现查。失败时把失败原因与旧缓存数据时间一起给渲染层，不静默用旧缓存。
+        fresh = ingest.refresh_ingest_cache(hours=24)
+        if not fresh.get('ok', True):
+            old_ts = (ingest.read_ingest_cache() or {}).get('ts') or 0
+            data['ingest'] = {
+                'error': '入库扫描失败：%s' % (fresh.get('error') or '未知原因'),
+                'old_data_time': time.strftime('%H:%M', time.localtime(old_ts)) if old_ts else '',
+                'stats': {}, 'rows': [],
+            }
+        else:
+            st = fresh.get('stats') or {}
+            tree = fresh.get('tree') or {}
             tvd = tree.get('tv_detail') or {}
             movd = tree.get('mov_detail') or {}
             rows = []
@@ -623,15 +696,22 @@ def build_morning_report(items: list, force_refresh: bool = False, cache_only: b
                     for name, ts in names.items():
                         rows.append((float(ts or 0), src, cat, name, 0))
             rows.sort(key=lambda x: -x[0])
-            data['ingest'] = {'stats': st, 'rows': rows}
-        except Exception as e:
-            data['ingest'] = {'error': str(e)}
+            data['ingest'] = {'stats': st, 'rows': rows,
+                              'data_time': time.strftime('%H:%M', time.localtime(fresh.get('ts') or time.time()))}
+
+    if 'played' in items:
+        try:
+            rep = facts.recent_played_24h(hours=24)
+            if rep.get('errors') and not rep.get('records'):
+                data['played'] = {'error': '查询失败：%s' % '；'.join(rep['errors'][:3])}
+            else:
+                data['played'] = rep
+        except Exception as e:                       # EmbyFactError：块内显式失败
+            data['played'] = {'error': '查询失败：%s' % e}
 
     if 'subscriptions' in items:
         try:
-            # 晨报只引用当天「追更订阅」真正成功推送的汇报；不重新执行订阅检查。
-            rep = subscribe._load_subscription_report(today_only=True)
-            data['subs'] = (rep or {}).get('updates') or []
+            data['subs'] = _subs_updates_24h()
         except Exception as e:
             data['subs'] = {'error': str(e)}
 
@@ -641,9 +721,18 @@ def build_morning_report(items: list, force_refresh: bool = False, cache_only: b
             rep = gap_report(max_age=None, force_refresh=force_refresh, cache_only=(cache_only or not force_refresh))
             if rep.get('status') == 'error':
                 raise RuntimeError(rep.get('message'))
+            # S5（§5.5）：预扫失败（复用了旧缓存）→ 明写「数据来自 HH:MM」；
+            # 正常情况也带数据时间（缺集榜标题标注）。
+            ts = rep.get('cache_ts') or rep.get('ts') or 0
+            rep['data_time'] = time.strftime('%H:%M', time.localtime(ts)) if ts else ''
+            rep['prescan_fallback'] = bool(rep.get('from_cache') and force_refresh)
             data['gap'] = rep
         except Exception as e:
-            data['gap'] = {'error': str(e)}
+            # 预扫失败且无可用缓存：明写失败原因；有旧数据时附「数据来自 HH:MM」
+            old = read_emby_lib_cache(max_age=None) or {}
+            old_ts = old.get('ts') or 0
+            data['gap'] = {'error': str(e),
+                           'old_data_time': time.strftime('%H:%M', time.localtime(old_ts)) if old_ts else ''}
 
     return str(tgmsg_reports.morning_report(data))
 
