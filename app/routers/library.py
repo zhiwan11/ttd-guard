@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
 from app import config as _cfg
-from app import state, governance, wash, morning, tmdb, ingest, emby, stats, logger, facts
+from app import state, governance, wash, morning, tmdb, ingest, emby, stats, logger, facts, storage
 from app.routers.deps import auth, Args
 
 router = APIRouter()
@@ -148,15 +148,13 @@ def api_tmdb_progress():
 
 
 @router.get('/api/emby/library', dependencies=[Depends(auth)])
-def api_emby_library(force: int = 0, with_tmdb: int = 1, cache_only: int = 0):
-    # 只读缓存模式（进入「片库映射」页时用）：有 24 小时内的 TMDB 对照缓存就秒回，
-    # 没有就返回 nocache，绝不因为打开页面而触发对照
-    if cache_only:
-        cached = morning.read_emby_lib_cache(max_age=24 * 3600)
-        if cached:
-            cached['from_cache'] = True
-            return cached
-        return {'status': 'nocache'}
+def api_emby_library(force: int = 0, with_tmdb: int = 1):
+    """片库映射数据源（S3 起废除 cache_only=1 口径——页打开读 /api/mapping）。
+
+    - with_tmdb=0：快速模式，只拉 Emby 库，不查 TMDB；
+    - 非 force：读 6 小时内的 TMDB 对照缓存；
+    - force=1：启动后台对照任务，立即返回。
+    """
     # 快速模式：不查 TMDB
     if not with_tmdb:
         return morning.action_emby_library(Args(force=False, with_tmdb=False))
@@ -173,6 +171,102 @@ def api_emby_library(force: int = 0, with_tmdb: int = 1, cache_only: int = 0):
     import threading as _th
     _th.Thread(target=morning.refresh_tmdb_scan, daemon=True).start()
     return {'status': 'started', 'message': 'TMDB 对照已在后台启动'}
+
+
+@router.get('/api/mapping', dependencies=[Depends(auth)])
+def api_mapping():
+    """片库映射页秒开（§5.2/§4.3 D1）：立刻返回事实层已有数据 + 数据时间。
+
+    - 有事实数据：返回 series/movies/stats（分类来自 facts.classify 的中文六态）
+      与每条事实的 data_time；前端随即对屏幕内的剧走 /api/mapping/verify 现查更新；
+    - 尚无任何事实：返回 {status:'success', empty:true, message:'尚未扫描'}——
+      明确提示而不是 nocache 报错（废除旧 cache_only=1 的 24h 窗口口径）；
+      全库统计的新鲜度仍靠后台 TMDB 对照（事实库由它写入）。
+    """
+    facts_rows = storage.db_facts_all('tv')
+    if not facts_rows:
+        return {'status': 'success', 'empty': True,
+                'message': '尚未扫描：请点「重新对照」建立事实基线（后台运行，完成后自动刷新）'}
+    series, movies = [], []
+    for row in facts_rows:
+        p = row['payload'] or {}
+        cls = p.get('classification') or {}
+        series.append({
+            'id': (p.get('series_ids') or ['tv:' + str(row['tmdb_id'])])[0],
+            'series_ids': p.get('series_ids') or [],
+            'tmdb_id': row['tmdb_id'], 'name': p.get('series_name') or '',
+            'in_local': bool(p.get('in_local')), 'in_share': bool(p.get('in_share')),
+            'have_eps': p.get('have_total') or 0,
+            'total_episodes': p.get('have_total') or 0,
+            'tmdb_total': p.get('tmdb_total') or 0,
+            'declared_total': p.get('declared_total') or 0,
+            'data_time': time.strftime('%Y-%m-%d %H:%M', time.localtime(row['updated_at'])),
+            'tmdb_info': {
+                'match_status': cls.get('status', 'unmatched'),
+                'status_cn': cls.get('label', '未匹配'),
+                'missing_ranges': cls.get('missing_ranges', ''),
+                'extra_total': len(cls.get('extra') or []),
+                'tmdb_total': p.get('tmdb_total') or 0,
+                'declared_total': p.get('declared_total') or 0,
+                'diff': (p.get('have_total') or 0) - (p.get('tmdb_total') or 0),
+                'manual_done': bool(cls.get('manual_done')),
+                'source': 'facts',
+            },
+        })
+    for row in storage.db_facts_all('movie'):
+        p = row['payload'] or {}
+        movies.append({
+            'id': (p.get('movie_ids') or ['movie:' + str(row['tmdb_id'])])[0],
+            'ids': p.get('movie_ids') or [],
+            'tmdb_id': row['tmdb_id'], 'name': p.get('name') or '',
+            'in_local': bool(p.get('in_local')), 'in_share': bool(p.get('in_share')),
+            'data_time': time.strftime('%Y-%m-%d %H:%M', time.localtime(row['updated_at'])),
+            'source': 'facts',
+        })
+    stats = morning._recompute_mapping_stats_dict(series)
+    return {'status': 'success', 'empty': False, 'series': series, 'movies': movies,
+            'stats': stats, 'ts': max(r['updated_at'] for r in facts_rows),
+            'data_time': time.strftime('%Y-%m-%d %H:%M', time.localtime(
+                max(r['updated_at'] for r in facts_rows)))}
+
+
+MAPPING_VERIFY_MAX = 30       # 屏幕内重验一次最多 30 部（40 卡页面可视区通常更少）
+MAPPING_VERIFY_WORKERS = 8
+
+
+@router.get('/api/mapping/verify', dependencies=[Depends(auth)])
+def api_mapping_verify(ids: str = '', media: str = 'tv'):
+    """屏幕内的剧打开/可见时后台重验（D1/§4.3）：并发现查 Emby 事实并回写事实库。
+
+    与探索第二段同一条事实层路径（facts.get_*_status），手动完结标记必须携带，
+    防止实时刷新把已完结的剧重新打回「缺集」。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    id_list = [x.strip() for x in (ids or '').split(',') if x.strip()][:MAPPING_VERIFY_MAX]
+    if not id_list:
+        return {'status': 'error', 'message': 'ids 为空'}
+    if media not in ('tv', 'movie'):
+        return {'status': 'error', 'message': 'media 必须是 tv 或 movie'}
+
+    done_ids = set()
+    if media == 'tv':
+        try:
+            done_ids = {str(k) for k, _v in (morning.read_manual_done() or {}).items()}
+        except Exception as e:
+            logging.getLogger('media_agent').warning('映射重验读取手动完结失败: %s', e)
+
+    def _one(tid):
+        try:
+            if media == 'movie':
+                return facts.get_movie_status(tid)
+            return facts.get_series_status(tid, manual_done=(tid in done_ids))
+        except Exception as e:            # EmbyFactError 及一切意外都显式化，不冒充「未入库」
+            return {'status': 'error', 'tmdb_id': tid, 'message': str(e)}
+
+    with ThreadPoolExecutor(max_workers=MAPPING_VERIFY_WORKERS) as pool:
+        data = list(pool.map(_one, id_list))
+    return {'status': 'success', 'media': media, 'data': data, 'count': len(data),
+            'data_time': time.strftime('%Y-%m-%d %H:%M', time.localtime())}
 
 
 @router.get('/api/library_stats', dependencies=[Depends(auth)])

@@ -1143,7 +1143,7 @@ window.addEventListener('unhandledrejection', function(e){
           <div class="panel">
             <h3 data-icon="activity">剧集健康度</h3>
             <div class="hl-wrap">
-              <div class="ring" id="dash-ring"><b id="dash-ring-n">—</b><span>对齐率</span></div>
+              <div class="ring" id="dash-ring"><b id="dash-ring-n">—</b><span>完整率</span></div>
               <div class="hl-legend" id="dash-health"><div class="list-empty">尚无对照缓存，去「片库映射」对照一次</div></div>
             </div>
           </div>
@@ -1334,14 +1334,16 @@ window.addEventListener('unhandledrejection', function(e){
             <input type="text" id="embySearch" class="map-search" placeholder="搜索片名..." oninput="embyPage = 1; renderEmbyList()">
             <button class="btn gray" onclick="loadEmbyLibrary(false, true)" data-icon="refresh">读缓存</button>
             <button class="btn" onclick="loadEmbyLibrary(true, true)" data-icon="refresh">重新对照</button>
+            <span id="embyDataTime" style="font-size:11px;color:#9ca3af;display:none"></span>
           </div>
           <div class="map-r2">
             <div class="segmented" id="embyFilter">
               <button class="active" data-f="all" onclick="setEmbyFilter('all')">全部 <i class="n" id="mc-all"></i></button>
-              <button data-f="aligned" onclick="setEmbyFilter('aligned')"><b class="dd ok"></b>对齐 <i class="n" id="mc-aligned"></i></button>
+              <button data-f="aligned" onclick="setEmbyFilter('aligned')"><b class="dd ok"></b>完整 <i class="n" id="mc-aligned"></i></button>
               <button data-f="missing" onclick="setEmbyFilter('missing')"><b class="dd err"></b>缺集 <i class="n" id="mc-missing"></i></button>
               <button data-f="extra" onclick="setEmbyFilter('extra')"><b class="dd warn"></b>超集 <i class="n" id="mc-extra"></i></button>
               <button data-f="ongoing" onclick="setEmbyFilter('ongoing')"><b class="dd info"></b>在更 <i class="n" id="mc-ongoing"></i></button>
+              <button data-f="ongoing_lagging" onclick="setEmbyFilter('ongoing_lagging')"><b class="dd err"></b>在更·落后 <i class="n" id="mc-ongoing-lagging"></i></button>
               <button data-f="unmatched" onclick="setEmbyFilter('unmatched')"><b class="dd dim"></b>未匹配 <i class="n" id="mc-unmatched"></i></button>
             </div>
             <div class="segmented" id="embyScopeFilter">
@@ -2712,7 +2714,7 @@ function renderDashEmby(x){
   var pct = total ? Math.round((st.aligned || 0) / total * 100) : 0;
   $('dash-ring').style.setProperty('--p', pct);
   $('dash-ring-n').textContent = total ? pct + '%' : '—';
-  var rows = [['对齐', 'ok', st.aligned], ['缺集', 'err', st.missing], ['超集', 'warn', st.extra], ['在更', 'info', st.ongoing], ['未匹配', 'dim', st.unmatched]];
+  var rows = [['完整', 'ok', st.aligned], ['缺集', 'err', st.missing], ['超集', 'warn', st.extra], ['在更', 'info', st.ongoing], ['在更·落后', 'err', st.ongoing_lagging], ['未匹配', 'dim', st.unmatched]];
   $('dash-health').innerHTML = rows.map(function(r){
     var n = r[2] || 0;
     return '<div class="hl-row"><b class="dd ' + r[1] + '"></b>' + r[0] + '<span class="cnt">' + n.toLocaleString() + '</span><span class="pc">' + (total ? (n / total * 100).toFixed(1) : '0.0') + '%</span></div>';
@@ -2743,8 +2745,9 @@ async function loadDashEmby(){
   if (!src && embyLoaded) src = { series: embyData.series, movies: embyData.movies, stats: embyData.stats };
   if (!src) {
     try {
-      var r2 = await api('/api/emby/library?force=0&with_tmdb=1&cache_only=1');
-      if (r2 && r2.status === 'success') src = { series: r2.series || [], movies: r2.movies || [], stats: md_sync(r2.series || [], r2.stats || {}) };
+      /* S3：cache_only 已废除，改读事实层口径的 /api/mapping */
+      var r2 = await api('/api/mapping');
+      if (r2 && r2.status === 'success' && !r2.empty) src = { series: r2.series || [], movies: r2.movies || [], stats: md_sync(r2.series || [], r2.stats || {}) };
     } catch(e){}
   }
   if (!src) return;
@@ -3615,6 +3618,9 @@ function startTmdbProgressWatch(){
 }
 
 async function loadEmbyLibrary(force, withTmdb, cacheOnly){
+  /* S3：cacheOnly 参数已废弃（后端 /api/emby/library 不再收 cache_only）。
+     页面打开（force=0）改走 /api/mapping：立刻渲染事实层已有数据 + 数据时间，
+     没有数据提示「尚未扫描」而不是报错；随后对屏幕内的剧后台重验就地更新（D1）。 */
   if (force && withTmdb) {
     startTmdbProgressWatch();
     try {
@@ -3625,45 +3631,109 @@ async function loadEmbyLibrary(force, withTmdb, cacheOnly){
       }
     } catch(e) {}
   }
-  var msg = cacheOnly ? '正在读取片库缓存...' : (withTmdb ? '正在拉取 Emby + TMDB（首次可能较慢）...' : '正在拉取 Emby 库...');
+  if (!force && withTmdb) {
+    /* 秒开路径：事实层已有数据立即渲染；尚无事实时提示尚未扫描 */
+    try {
+      var m = await api('/api/mapping');
+      if (m && m.status === 'success' && m.empty) {
+        $('embyList').innerHTML = '<div class="list-empty">' + esc(m.message || '尚未扫描') + '</div>';
+        return;
+      }
+      if (m && m.status === 'success' && (m.series || []).length) {
+        applyMappingData(m, true);
+        verifyVisibleMapping();
+        return;
+      }
+    } catch(e) { /* /api/mapping 失败照旧走旧链路兜底 */ }
+  }
+  var msg = withTmdb ? '正在拉取 Emby + TMDB（首次可能较慢）...' : '正在拉取 Emby 库...';
   $('embyList').innerHTML = '<div class="list-empty">' + msg + '</div>';
   try {
-    var url = '/api/emby/library?force=' + (force ? 1 : 0) + '&with_tmdb=' + (withTmdb ? 1 : 0) + (cacheOnly ? '&cache_only=1' : '');
+    var url = '/api/emby/library?force=' + (force ? 1 : 0) + '&with_tmdb=' + (withTmdb ? 1 : 0);
     var r = await api(url);
-    // 没有对照缓存（首次使用 / 缓存太旧）：退回快速模式，只拉 Emby 库，不触发 TMDB 对照
-    if (cacheOnly && r.status === 'nocache') return loadEmbyLibrary(false, false);
     if (r.status !== 'success') throw new Error(r.message || '失败');
-    if (cacheOnly && r.ts) toast('已载入片库缓存（' + fmtAgo(r.ts) + '对照），需要最新数据请点「对照 TMDB」', 'success', 3200);
-    embyData.series = r.series || [];
-    embyData.movies = r.movies || [];
-    await mdLoad();
-    embyData.statsBase = r.stats || {};
-    embyData.stats = md_sync(embyData.series, embyData.statsBase);
-    /* 缓存 Emby 主机地址（后端在返回里带了 emby_host），供"在 Emby 中打开"链接使用 */
-    if (r.emby_host) window.__embyHost = r.emby_host;
-    window.__embySeriesMap = {};
-    embyData.series.forEach(function(x){ if (x.id) window.__embySeriesMap[x.id] = x; });
-    window.__embyMovieMap = {};
-    embyData.movies.forEach(function(x){ if (x.id) window.__embyMovieMap[x.id] = x; });
-    embyLoaded = true;
-    var st = embyData.stats;
-    $('embyStats').style.display = '';
-    $('embyStats2').style.display = '';
-    $('embyTitle1').style.display = '';
-    $('embyTitle2').style.display = '';
-    $('emby-title-count').textContent = st.total_series || 0;
-    $('emby-title-movies').textContent = st.total_movies || 0;
-    $('emby-total').textContent      = st.total_series || 0;
-    $('emby-aligned').textContent    = st.aligned || 0;
-    $('emby-missing').textContent    = st.missing || 0;
-    $('emby-extra').textContent      = st.extra || 0;
-    $('emby-ongoing').textContent    = st.ongoing || 0;
-    $('emby-unmatched').textContent  = (st.unmatched || 0) + (st.no_tmdb || 0);
-    $('emby-movies').textContent     = st.total_movies || 0;
-    $('emby-tmdb-errors').textContent = r.tmdb_errors || 0;
-    updateEmbyChips();
-    renderEmbyList();
+    applyMappingData(r, false);
   } catch(e){ $('embyList').innerHTML = '<div class="list-empty">' + esc(e.message) + '</div>'; }
+}
+
+/* S3：把后端返回（对照缓存或事实层 /api/mapping）落到页面状态并渲染 */
+function applyMappingData(r, fromFacts){
+  embyData.series = r.series || [];
+  embyData.movies = r.movies || [];
+  mdLoad();
+  embyData.statsBase = r.stats || {};
+  embyData.stats = md_sync(embyData.series, embyData.statsBase);
+  /* A5 断言：完整+缺集+超集+在更+在更·落后+未匹配 之和 = 总剧数（前端护栏） */
+  (function(){
+    var st = embyData.stats || {};
+    var sum = (st.aligned || 0) + (st.missing || 0) + (st.extra || 0) + (st.ongoing || 0)
+            + (st.ongoing_lagging || 0) + (st.unmatched || 0) + (st.no_tmdb || 0) + (st.pending || 0);
+    if (st.total_series && sum !== st.total_series)
+      console.warn('[A5] 状态分类之和 ' + sum + ' ≠ 总剧数 ' + st.total_series);
+  })();
+  /* 缓存 Emby 主机地址（后端在返回里带了 emby_host），供"在 Emby 中打开"链接使用 */
+  if (r.emby_host) window.__embyHost = r.emby_host;
+  window.__embySeriesMap = {};
+  embyData.series.forEach(function(x){ if (x.id) window.__embySeriesMap[x.id] = x; });
+  window.__embyMovieMap = {};
+  embyData.movies.forEach(function(x){ if (x.id) window.__embyMovieMap[x.id] = x; });
+  embyLoaded = true;
+  var st = embyData.stats;
+  $('embyStats').style.display = '';
+  $('embyStats2').style.display = '';
+  $('embyTitle1').style.display = '';
+  $('embyTitle2').style.display = '';
+  $('emby-title-count').textContent = st.total_series || 0;
+  $('emby-title-movies').textContent = st.total_movies || 0;
+  $('emby-total').textContent      = st.total_series || 0;
+  $('emby-aligned').textContent    = st.aligned || 0;
+  $('emby-missing').textContent    = st.missing || 0;
+  $('emby-extra').textContent      = st.extra || 0;
+  $('emby-ongoing').textContent    = st.ongoing || 0;
+  $('emby-unmatched').textContent  = (st.unmatched || 0) + (st.no_tmdb || 0);
+  $('emby-movies').textContent     = st.total_movies || 0;
+  $('emby-tmdb-errors').textContent = r.tmdb_errors || 0;
+  /* S3：数据时间（事实层 / 控制缓存均携带 ts）；显示在列表标题旁 */
+  var dtEl = $('embyDataTime');
+  if (dtEl) {
+    if (r.data_time || r.ts) {
+      dtEl.textContent = ' · 事实数据：' + (r.data_time || fmtAgo(r.ts)) + (fromFacts ? '（屏幕内剧集会自动重验）' : '');
+      dtEl.style.display = '';
+    } else { dtEl.style.display = 'none'; }
+  }
+  updateEmbyChips();
+  renderEmbyList();
+  if (fromFacts && typeof refreshExploreStatus === 'undefined') { /* noop */ }
+}
+/* S3（D1/§4.3）：屏幕内的剧后台重验——对当前已渲染的前 30 部并发现查并就地更新 */
+function verifyVisibleMapping(){
+  try {
+    var ids = embyData.series.slice(0, 30).map(function(x){ return String(x.tmdb_id || ''); })
+      .filter(function(x){ return x && x !== 'null'; });
+    if (!ids.length) return;
+    var uniq = Array.from(new Set(ids));
+    api('/api/mapping/verify?ids=' + encodeURIComponent(uniq.join(',')) + '&media=tv').then(function(r){
+      if (!r || r.status !== 'success') return;
+      (r.data || []).forEach(function(row){
+        var tid = String(row.tmdb_id || (row.fact && row.fact.tmdb_id) || '');
+        var s = embyData.series.find(function(x){ return String(x.tmdb_id) === tid; });
+        if (!s) return;
+        if (row.status === 'error') { s._verifyError = row.message; return; }
+        var cls = row.classification || {};
+        var ti = s.tmdb_info = s.tmdb_info || {};
+        ti.match_status = cls.status || ti.match_status;
+        ti.status_cn = cls.label || ti.status_cn;
+        ti.missing_ranges = cls.missing_ranges || '';
+        ti.extra_total = (cls.extra || []).length;
+        ti.manual_done = !!cls.manual_done;
+        ti.diff = (row.fact.have_total || 0) - (ti.tmdb_total || 0);
+        s.have_eps = row.fact.have_total || s.have_eps;
+        s.data_time = row.data_time;
+      });
+      embyData.stats = md_sync(embyData.series, embyData.statsBase || {});
+      renderEmbyList();
+    }).catch(function(){});
+  } catch(e){}
 }
 function loadMoreEmby(){ embyMore(); }
 function embyMore(){
@@ -3693,7 +3763,8 @@ function updateEmbyLoadMore(total){
 function updateEmbyChips(){
   var st = embyData.stats || {};
   var m = { 'mc-series': st.total_series, 'mc-all': st.total_series, 'mc-movies': st.total_movies, 'mc-aligned': st.aligned,
-            'mc-missing': st.missing, 'mc-extra': st.extra, 'mc-ongoing': st.ongoing, 'mc-unmatched': (st.unmatched || 0) + (st.no_tmdb || 0) };
+            'mc-missing': st.missing, 'mc-extra': st.extra, 'mc-ongoing': st.ongoing,
+            'mc-ongoing-lagging': st.ongoing_lagging, 'mc-unmatched': (st.unmatched || 0) + (st.no_tmdb || 0) };
   for (var k in m) { var e = $(k); if (e) e.textContent = (m[k] || 0).toLocaleString(); }
 }
 
@@ -3956,8 +4027,12 @@ function showEmbyDetailById(id){
   if (ti.tmdb_total != null && ti.tmdb_total > 0) {
     var have = s.have_eps != null ? s.have_eps : (s.total_episodes || 0);
     html += '已入库 ' + have + '/' + (ti.declared_total || ti.tmdb_total) + ' 集';
-    // 弹窗数据来自「片库映射」的全量对照缓存，可能滞后于刚入库的集
-    html += ' <span style="color:#9ca3af">（对照缓存，刚入库的集可能未反映）</span>';
+    // S3（§5.3/A5）：数据时间诚实标注——事实层来源带 data_time，旧对照缓存注明可能滞后
+    if (s.data_time) {
+      html += ' <span style="color:#9ca3af">· 事实数据：' + esc(s.data_time) + '</span>';
+    } else {
+      html += ' <span style="color:#9ca3af">（对照缓存，刚入库的集可能未反映）</span>';
+    }
   } else if (s.in_local && s.in_share) {
     html += '本地 ' + (s.local_eps || 0) + ' / 分享 ' + (s.share_eps || 0) + ' 集';
   } else {
@@ -4097,8 +4172,9 @@ function applySeriesDeleteResult(seriesId, r){
 
 async function refreshSingleSeriesInList(seriesId, deletedTarget){
   try {
-    /* 服务端已按磁盘真实文件修补了缓存：直接读回该剧最新条目（缓存只读，不触发 TMDB 对照） */
-    var r = await api('/api/emby/library?force=0&with_tmdb=1&cache_only=1');
+    /* S3：cache_only 已废除。读回走 /api/mapping（事实层秒回）；该局刷新由服务端
+       已修补的映射缓存兜底 —— 旧对照缓存里的条目仍在（S7 再统一收） */
+    var r = await api('/api/emby/library?force=0&with_tmdb=1');
     var fresh = (r && r.series) ? r.series.find(function(x){ return x.id === seriesId; }) : null;
     var idx = embyData.series.findIndex(function(x){ return x.id === seriesId; });
     if (!fresh) {

@@ -160,7 +160,10 @@ def ingest_card(res):
 def _gap_stats(icon, title, st, sub='', extra=''):
     rows = [str(blocks.tg_title(icon, title, sub)), '',
             str(blocks.tg_row('📚', '剧集总数', st.get('total', 0))),
-            str(blocks.tg_row('✅', '对齐', st.get('aligned', 0), '在更 %s' % st.get('ongoing', 0))),
+            str(blocks.tg_row('✅', '完整', st.get('aligned', 0),
+                              '在更 %s%s' % (st.get('ongoing', 0),
+                                            (' · 在更·落后 %s' % st.get('ongoing_lagging', 0))
+                                            if st.get('ongoing_lagging') else ''))),
             str(blocks.tg_row('⚠️', '缺集', st.get('missing', 0),
                               '超集 %s · 未匹配 %s' % (st.get('extra', 0), st.get('unmatched', 0))))]
     if extra:
@@ -296,6 +299,6 @@ def morning_report(data):
                 if len(broken) > len(shown):
                     lines.append('<i>…另有 %d 部，完整清单见 Web「片库映射」</i>' % (len(broken) - len(shown)))
             else:
-                lines.append('✅ 全部对齐')
+                lines.append('✅ 全部完整')
 
     return th.Html('\n'.join(lines))

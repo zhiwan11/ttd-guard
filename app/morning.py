@@ -12,7 +12,7 @@ from . import config as _cfg
 from . import logger
 from .core import (esc, parse_season_dir, get_ep, title_key, governance_title_key,
                    analyze_season_episodes, parse_emby_library, quality_label, RE_SXXEXX)
-from . import state, governance, tmdb, ingest, subscribe, emby, lib, stats, tg, storage, media, sync
+from . import state, governance, tmdb, ingest, subscribe, emby, lib, stats, tg, storage, media, sync, facts
 from .tgmsg import reports as tgmsg_reports
 
 log = logging.getLogger('media_agent')
@@ -24,6 +24,58 @@ _WEEK = '一二三四五六日'
 # ═══════════════════ 晨报 ═══════════════════
 MORNING_GAP_TOP = 50   # 晨报里最多列出多少部缺集剧（按缺得最多排序），完整清单看 Web
 MORNING_INGEST_TOP = 60  # 晨报里最多列出多少条入库明细（最近入库置顶），完整清单看 Web
+
+
+def _sync_series_fact(entry, tmdb_info, manual_done=False):
+    """S3（§5.3）：把全量对照扫出的分集事实直接回写事实库并持久化分类。
+
+    - 扫描循环里已经拿到了这部剧的全部分集（entries 的 seasons/local/share），
+      借鉴撤回版「免二次查 Emby」：直接回写 media_facts，探索/订阅读事实层时
+      不用再对同一部剧现查一遍；
+    - 分类统一走 facts.classify（全仓唯一分类函数）并把分类结果随同一份 payload
+      一次落盘（同一条事实只写一次库）；
+    - morning 不再调 facts 私有 API（facts._load_tmdb_info 等）。
+    """
+    tid = entry.get('tmdb_id')
+    if not tid:
+        return None
+    have = set()
+    for se in (entry.get('seasons') or []):
+        sn = se.get('season', 0)
+        for en in range(1, int(se.get('max_ep') or 0) + 1):
+            k = facts.ep_key(sn, en)
+            if k and en not in set(se.get('missing') or ()):
+                have.add(k)
+    cls = facts.classify(have, tmdb_info, manual_done=manual_done)
+    payload = {
+        'media_type': 'tv', 'tmdb_id': str(tid), 'matched': True,
+        'series_ids': [str(x) for x in (entry.get('series_ids') or []) if x],
+        'series_name': entry.get('name') or '',
+        'episodes': sorted(have),
+        'special': [], 'created': {},
+        'in_local': bool(entry.get('in_local')), 'in_share': bool(entry.get('in_share')),
+        'have_total': len(have),
+        'tmdb_total': (tmdb_info or {}).get('total_episodes') or 0,
+        'declared_total': (tmdb_info or {}).get('declared_total') or 0,
+        'classification': cls,
+        'source_scan': 'mapping',
+    }
+    facts._persist_fact('tv', str(tid), payload)
+    return cls
+
+
+def _sync_movie_fact(movie):
+    """电影事实回写（全量对照扫出 in_local/in_share，免二次查 Emby）。"""
+    tid = movie.get('tmdb_id')
+    if not tid:
+        return
+    facts._persist_fact('movie', str(tid), {
+        'media_type': 'movie', 'tmdb_id': str(tid), 'matched': True,
+        'movie_ids': [str(x) for x in (movie.get('ids') or []) if x],
+        'name': movie.get('name') or '',
+        'in_local': bool(movie.get('in_local')), 'in_share': bool(movie.get('in_share')),
+        'source_scan': 'mapping',
+    })
 
 
 def _save_overview_disk(out):
@@ -243,6 +295,22 @@ def _stat_bucket(st):
             'unmatched': 'unmatched', 'aligned': 'aligned',
             'no_tmdb': 'unmatched', 'pending': 'unmatched'}.get(st, 'unmatched')
 
+
+def _recompute_mapping_stats_dict(series):
+    """从 series 行列表（含 tmdb_info.match_status）重算映射统计 dict（S3 /api/mapping 用）。"""
+    stats = {'total_series': len(series or []),
+             'aligned': 0, 'missing': 0, 'extra': 0, 'ongoing': 0, 'ongoing_lagging': 0,
+             'unmatched': 0, 'complete_series': 0, 'incomplete_series': 0}
+    for s in (series or []):
+        st = _stat_bucket(_cn_status((s.get('tmdb_info') or {}).get('match_status', 'unmatched')))
+        if st in stats:
+            stats[st] += 1
+        if s.get('complete') or st == 'aligned':
+            stats['complete_series'] += 1
+        else:
+            stats['incomplete_series'] += 1
+    return stats
+
 def read_manual_done() -> dict:
     """人工标记「已完结」的剧集：Emby 条目 id → {name, ts}。
     TMDB 季数 / 集数与实际不符（如国产剧只有一季而 TMDB 有很多季）时手动标记，
@@ -293,7 +361,8 @@ def build_library_health_snapshot(max_age=1800):
             top.append({'name': s.get('name'), 'year': s.get('year'),
                         'diff': abs(int(ti.get('diff') or 0)),
                         'tot': int(ti.get('tmdb_total') or 0),
-                        'have': int(s.get('have_eps') or s.get('total_episodes') or 0)})
+                        'have': int(s.get('have_eps') or s.get('total_episodes') or 0),
+                        'missing_ranges': ti.get('missing_ranges') or ''})
     top.sort(key=lambda x: x['diff'], reverse=True)
     eps = sum(int(s.get('have_eps') or s.get('total_episodes') or 0) for s in series)
     snapshot = {'schema_version': 1, 'ts': data.get('ts') or 0,
@@ -356,7 +425,8 @@ def unified_health(max_age=1800):
                     top.append({'name': row.get('name'), 'year': row.get('year'),
                                 'diff': abs(int(ti.get('diff') or 0)),
                                 'tot': int(ti.get('tmdb_total') or 0),
-                                'have': int(row.get('have_eps') or row.get('total_episodes') or 0)})
+                                'have': int(row.get('have_eps') or row.get('total_episodes') or 0),
+                                'missing_ranges': ti.get('missing_ranges') or ''})
             top.sort(key=lambda x: x['diff'], reverse=True)
             return {'schema_version': 1, 'ts': cached.get('ts') or 0,
                     'series': series, 'movies': movies, 'stats': stats,
@@ -418,9 +488,13 @@ def gap_report(max_age=30 * 60, force_refresh=False, cache_only=False):
         if (b := _stat_bucket(st)) in stats: stats[b] += 1
         if st == 'missing': missing.append(s_)
     missing.sort(key=lambda x: (x.get('tmdb_info') or {}).get('diff') or 0)  # diff 为负，越小缺得越多
+    for s_ in missing:
+        # S3（§5.3）：缺集榜带精确集号区间（tmdb_info.missing_ranges 由 facts.classify 产出）
+        s_['missing_ranges'] = (s_.get('tmdb_info') or {}).get('missing_ranges') or ''
     return {'status': 'success', 'missing': missing, 'stats': stats,
             'movies_total': len(data.get('movies') or []),
-            'from_cache': from_cache, 'cache_ts': data.get('ts') or 0}
+            'from_cache': from_cache, 'cache_ts': data.get('ts') or 0,
+            'data_time': time.strftime('%Y-%m-%d %H:%M', time.localtime(data.get('ts') or time.time()))}
 
 def action_emby_library(args):
     force = bool(getattr(args, 'force', False))
@@ -432,19 +506,23 @@ def action_emby_library(args):
         return {'status': 'error', 'message': f'拉取 Emby 库失败: {e}'}
     series = data['series']; movies = data['movies']
     tmdb_errors = 0
-    # 所有 series 先标 pending
+    # with_tmdb=False（快速模式）时的占位：S1 六态只有六档，「待对照」不是状态——
+    # 用 unmatched + unscanned=True 表达「还没跑对照」，不再造第七个英文枚举。
     for s in series:
-        s['tmdb_info'] = {'match_status': 'pending', 'tmdb_status': None,
+        s['tmdb_info'] = {'match_status': 'unmatched', 'status_cn': '未匹配',
+                          'unscanned': True,
                           'local_total': s.get('total_episodes', 0),
                           'tmdb_total': None, 'diff': None, 'seasons': []}
 
     if with_tmdb:
         t = tmdb.Tmdb()
         has_key = bool(t.key)
+        done = read_manual_done()
         for s in series:
             tmdb_id = s.get('tmdb_id')
             if not tmdb_id:
-                s['tmdb_info'] = {'match_status': 'no_tmdb' if has_key else 'unmatched',
+                # 未匹配（无 TMDB ID）；S1 六态内部键统一为 unmatched（中文展示由 status_cn 给出）
+                s['tmdb_info'] = {'match_status': 'unmatched', 'status_cn': '未匹配',
                                   'tmdb_status': None, 'local_total': s.get('total_episodes', 0),
                                   'tmdb_total': None, 'diff': None, 'seasons': []}
                 continue
@@ -454,7 +532,15 @@ def action_emby_library(args):
                 log.warning('TMDB 查询失败 %s: %s', tmdb_id, e); info = None; tmdb_errors += 1
             except Exception as e:
                 log.warning('TMDB 查询异常 %s: %s', tmdb_id, e); info = None; tmdb_errors += 1
-            s['tmdb_info'] = tmdb.classify_series_by_tmdb(s.get('seasons', []), info)
+            manual_done = str(tmdb_id) in {str(k) for k in done}
+            # 原始 TMDB 响应 → facts.classify 用的 aired/total 形态（classify_series_by_tmdb 内部兼容两种）
+            s['tmdb_info'] = tmdb.classify_series_by_tmdb(s.get('seasons', []), info,
+                                                          manual_done=manual_done)
+            # S3：扫出的分集事实回写事实库 + 分类持久化（免二次查 Emby）
+            try:
+                _sync_series_fact(s, info, manual_done=manual_done)
+            except Exception as e:
+                log.warning('事实回写失败 %s: %s', tmdb_id, e)
             # 照搬上游 TgtoDrive 的海报对照逻辑：TMDB 原始响应的 poster_path 直接保留，
             # 前端片库映射优先用 TMDB 官方最新图（Emby 缓存图只做兜底）。
             if info and info.get('poster_path'):
@@ -472,6 +558,12 @@ def action_emby_library(args):
                     continue
                 if _minfo and _minfo.get('poster_path'):
                     m['poster_tmdb'] = _minfo.get('poster_path')
+        # S3：电影事实回写（电影无需 TMDB 分类，matched 即事实）
+        for m in movies:
+            try:
+                _sync_movie_fact(m)
+            except Exception as e:
+                log.warning('电影事实回写失败 %s: %s', m.get('tmdb_id'), e)
         t.save()
     # 手动完结统一应用到后端快照，避免治理总览/晨报与片库映射各算一套。
     done = read_manual_done()
@@ -494,7 +586,9 @@ def action_emby_library(args):
         if s.get('complete') or _stat_bucket(st) == 'aligned': stats['complete_series'] += 1
         else: stats['incomplete_series'] += 1
     result = {'status': 'success', 'stats': stats, 'series': series, 'movies': movies,
-              'tmdb_errors': tmdb_errors, 'emby_host': state.EMBY_HOST}
+              'tmdb_errors': tmdb_errors, 'emby_host': state.EMBY_HOST,
+              'ts': time.time(),
+              'data_time': time.strftime('%Y-%m-%d %H:%M', time.localtime())}
     if with_tmdb:
         try:
             save_emby_lib_cache(result)
@@ -842,10 +936,11 @@ def _refresh_tmdb_scan():
         t = tmdb.Tmdb()
         has_key = bool(t.key)
         tmdb_errors = 0
+        done = read_manual_done()
         for i, s_ in enumerate(series):
             tmdb_id = s_.get('tmdb_id')
             if not tmdb_id:
-                s_['tmdb_info'] = {'match_status': 'no_tmdb' if has_key else 'unmatched',
+                s_['tmdb_info'] = {'match_status': 'unmatched', 'status_cn': '未匹配',
                                    'tmdb_status': None,
                                    'local_total': s_.get('total_episodes', 0),
                                    'tmdb_total': None, 'diff': None, 'seasons': []}
@@ -858,13 +953,25 @@ def _refresh_tmdb_scan():
                 except Exception as e:
                     log.warning('TMDB 查询异常 %s: %s', tmdb_id, e)
                     info = None; tmdb_errors += 1
-                s_['tmdb_info'] = tmdb.classify_series_by_tmdb(s_.get('seasons', []), info)
+                manual_done = str(tmdb_id) in {str(k) for k in done}
+                s_['tmdb_info'] = tmdb.classify_series_by_tmdb(s_.get('seasons', []), info,
+                                                               manual_done=manual_done)
+                # S3：扫出的分集事实回写事实库 + 分类持久化（免二次查 Emby）
+                try:
+                    _sync_series_fact(s_, info, manual_done=manual_done)
+                except Exception as e:
+                    log.warning('事实回写失败 %s: %s', tmdb_id, e)
             state._tmdb_scan_progress['done'] = i + 1
             if (i + 1) % 20 == 0 or (i + 1) == total:
                 el = time.time() - state._tmdb_scan_progress['started_at']
                 eta = el / (i + 1) * (total - i - 1)
                 log.info('TMDB 进度 %d/%d (%.0f%%) ETA %.0f 秒', i + 1, total,
                          (i + 1) / total * 100 if total else 100, eta)
+        for m in movies:
+            try:
+                _sync_movie_fact(m)
+            except Exception as e:
+                log.warning('电影事实回写失败 %s: %s', m.get('tmdb_id'), e)
         t.save()
         stats = {'total_series': len(series), 'total_movies': len(movies),
                  'aligned': 0, 'missing': 0, 'extra': 0, 'ongoing': 0, 'ongoing_lagging': 0,
@@ -876,7 +983,9 @@ def _refresh_tmdb_scan():
             if s_.get('complete') or _stat_bucket(st) == 'aligned': stats['complete_series'] += 1
             else: stats['incomplete_series'] += 1
         res = {'status': 'success', 'stats': stats, 'series': series, 'movies': movies,
-               'tmdb_errors': tmdb_errors, 'with_tmdb': True, 'emby_host': state.EMBY_HOST}
+               'tmdb_errors': tmdb_errors, 'with_tmdb': True, 'emby_host': state.EMBY_HOST,
+               'ts': time.time(),
+               'data_time': time.strftime('%Y-%m-%d %H:%M', time.localtime())}
         save_emby_lib_cache(res)
         save_library_snapshot(build_library_health_snapshot())
         _cfg.update_config(lambda c: c.__setitem__('tmdb_scan_last_ts', str(time.time())))

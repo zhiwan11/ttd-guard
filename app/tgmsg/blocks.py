@@ -115,11 +115,22 @@ def _diff(x):
 
 
 def gap_list(broken, top=None):
-    """缺集明细行：按缺得最多的排最前；top 限制条数。"""
+    """缺集明细行：按缺得最多的排最前；top 限制条数。
+
+    S3（§5.3）：行内带精确集号区间（missing_ranges 由 facts.classify 产出）；
+    旧缓存行没有该字段时退回纯集数。"""
     items = sorted(broken or [], key=lambda x: -_diff(x))
     if top is not None:
         items = items[:top]
-    return [th.Html('• 《%s》缺 <b>%d</b> 集' % (th.h(x.get('name')), _diff(x))) for x in items]
+    out = []
+    for x in items:
+        rng = (x.get('missing_ranges') or '').strip()
+        if rng:
+            out.append(th.Html('• 《%s》缺 <b>%s</b>（共 %d 集）'
+                               % (th.h(x.get('name')), th.h(rng), _diff(x))))
+        else:
+            out.append(th.Html('• 《%s》缺 <b>%d</b> 集' % (th.h(x.get('name')), _diff(x))))
+    return out
 
 
 def _sub_change_lines(u):

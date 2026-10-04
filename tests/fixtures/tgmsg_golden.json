@@ -28,10 +28,10 @@
   "📊 <b>24 小时入库</b>\n<i>📦 来自缓存 · 2 分钟前</i>\n\n🎬 电影　<b>+2 部</b>\n📺 剧集　<b>+3 部</b>　<i>+18 集</i>\n\n📺 <b>剧集明细</b>（点开展开全部 / 再点收起）\n<blockquote expandable><b>📂 本地影视库 · 国产剧</b> (2部)\n• 《剧甲》+5集\n• 《剧乙》+2集</blockquote>\n\n🎬 <b>电影明细</b>（点开展开全部 / 再点收起）\n<blockquote expandable><b>📂 分享影视库 · 外语电影</b> (1部)\n• 《电影甲》</blockquote>"
  ],
  "card_emby": [
-  "📺 <b>Emby 库总览</b>\n\n📚 剧集总数　<b>10</b>\n✅ 对齐　<b>7</b>　<i>在更 2</i>\n⚠️ 缺集　<b>3</b>　<i>超集 1 · 未匹配 0</i>\n🎬 电影总数　<b>5</b>\n\n<b>全部缺集（2 部）</b>（点开展开 / 再点收起）\n<blockquote expandable>• 《乙剧》缺 <b>7</b> 集\n• 《甲剧》缺 <b>2</b> 集</blockquote>"
+  "📺 <b>Emby 库总览</b>\n\n📚 剧集总数　<b>10</b>\n✅ 完整　<b>7</b>　<i>在更 2</i>\n⚠️ 缺集　<b>3</b>　<i>超集 1 · 未匹配 0</i>\n🎬 电影总数　<b>5</b>\n\n<b>全部缺集（2 部）</b>（点开展开 / 再点收起）\n<blockquote expandable>• 《乙剧》缺 <b>7</b> 集\n• 《甲剧》缺 <b>2</b> 集</blockquote>"
  ],
  "card_gap": [
-  "🧩 <b>缺集检测</b>\n<i>TMDB 对照 · 2 小时前</i>\n\n📚 剧集总数　<b>10</b>\n✅ 对齐　<b>7</b>　<i>在更 2</i>\n⚠️ 缺集　<b>3</b>　<i>超集 1 · 未匹配 0</i>\n\n<b>全部缺集（1 部）</b>（点开展开 / 再点收起）\n<blockquote expandable>• 《甲剧》缺 <b>2</b> 集</blockquote>"
+  "🧩 <b>缺集检测</b>\n<i>TMDB 对照 · 2 小时前</i>\n\n📚 剧集总数　<b>10</b>\n✅ 完整　<b>7</b>　<i>在更 2</i>\n⚠️ 缺集　<b>3</b>　<i>超集 1 · 未匹配 0</i>\n\n<b>全部缺集（1 部）</b>（点开展开 / 再点收起）\n<blockquote expandable>• 《甲剧》缺 <b>2</b> 集</blockquote>"
  ],
  "card_emby_error": [
   "❌ emby 失败: 拉取失败"
