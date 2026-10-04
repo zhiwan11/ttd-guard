@@ -366,37 +366,82 @@ def action_explore(args):
             'cards': cards, 'is_search': bool(query),
             'tmdb_calls': t.calls, 'tmdb_hits': t.hits}
 
-def classify_series_by_tmdb(local_seasons, tmdb_info):
-    """按 TMDB 已播集数对照片库，避免连载未播集造成假缺集。"""
-    local_map = {s['season']: s['episodes'] for s in local_seasons if s['season'] > 0}
+def classify_series_by_tmdb(local_seasons, tmdb_info, manual_done=False):
+    """按 TMDB 已播集数对照片库（S1 起为 facts.classify 的薄封装，§5.3 唯一口径）。
+
+    输入输出结构与既有调用方（片库映射 / 晨报 / TMDB 对照扫描）完全兼容：
+    ``match_status`` 由 facts.classify 给出**中文六态**（完整/缺集/超集/在更/
+    在更·落后/未匹配；D3 决策：在更·落后单独一档），同时保留 ``status_cn``/
+    ``missing_ranges``（精确集号区间）/ ``extra_total`` 扩展字段。
+    缺集判定从「数集数相减」改为 facts.classify 的**集合差集**——不再出现
+    「缺一个、多一个互相抵消」的假对齐。
+    """
+    from . import facts
+    keys = set()
+    for s in (local_seasons or []):
+        if s.get('season', 0) > 0:
+            for e in range(1, int(s.get('episodes') or 0) + 1):
+                k = facts.ep_key(s['season'], e)
+                if k:
+                    keys.add(k)
+    # 旧 fake 形态（晨报 _resync 里由缓存 tmdb_status/tmdb 逐季集数拼出）没有
+    # last_episode_to_air，不能走 media.tmdb_aired_map 的截断口径——直接按
+    # 各季 episode_count 展开成已播集合（与旧实现把 season_count 求和等价）。
+    if tmdb_info and 'aired' not in tmdb_info:
+        # 没有真 aired 集合时，标称总数退回 media.tmdb_totals（含未播，展示口径），
+        # 已播集合按各季 episode_count 展开（与旧实现 season_count 求和等价）。
+        fake_aired = set()
+        for s in (tmdb_info.get('seasons') or []):
+            sn = s.get('season_number')
+            if sn is None or int(sn) <= 0:
+                continue
+            for e in range(1, int(s.get('episode_count') or 0) + 1):
+                k = facts.ep_key(int(sn), e)
+                if k:
+                    fake_aired.add(k)
+        fake = dict(tmdb_info)
+        fake['aired'] = fake_aired
+        fake['total_episodes'] = media.tmdb_totals(tmdb_info)['aired'] if tmdb_info.get('last_episode_to_air') else len(fake_aired)
+        fake['declared_total'] = media.tmdb_totals(tmdb_info)['declared']
+        tmdb_info = fake
+    cls = facts.classify(keys, tmdb_info, manual_done=manual_done)
+    local_map = {s['season']: s['episodes'] for s in (local_seasons or []) if s['season'] > 0}
     local_total = sum(local_map.values())
-    if not tmdb_info:
-        return {'match_status': 'unmatched', 'tmdb_status': None,
-                'local_total': local_total, 'tmdb_total': None, 'declared_total': None, 'diff': None,
-                'seasons': [{'season': sn, 'local': local_map[sn], 'tmdb': None, 'diff': None, 'status': 'unknown'} for sn in sorted(local_map)]}
-    tmdb_status = tmdb_info.get('status', '') or ''
-    # 已播集：唯一口径在 media.tmdb_aired_map（按 last_episode_to_air 裁剪、排除 S00）。
-    tmdb_map = media.tmdb_aired_map(tmdb_info)
-    # 标称总集数（含未播集，与上游 TgtoDrive 显示口径一致，如 18/24）；仅用于展示，缺集判断仍按已播集
-    declared_total = media.tmdb_totals(tmdb_info)['declared']
-    tmdb_total = sum(tmdb_map.values())
     season_diff = []
-    for sn in sorted(set(local_map.keys()) | set(tmdb_map.keys())):
-        l = local_map.get(sn, 0); t_ = tmdb_map.get(sn, 0)
+    per_season_aired = _aired_per_season(tmdb_info)
+    for sn in sorted(set(local_map.keys()) | set(per_season_aired.keys())):
+        l = int(local_map.get(sn, 0) or 0); t_ = int(per_season_aired.get(sn, 0) or 0)
         if l == t_: st = 'aligned'
         elif l < t_: st = 'missing'
         else: st = 'extra'
         season_diff.append({'season': sn, 'local': l, 'tmdb': t_, 'diff': l - t_, 'status': st})
-    is_ongoing = tmdb_status in ('Returning Series', 'In Production', 'Planned', 'Pilot')
-    if is_ongoing:
-        status = 'aligned' if local_total >= tmdb_total else 'ongoing'
-    else:
-        if local_total == tmdb_total: status = 'aligned'
-        elif local_total < tmdb_total: status = 'missing'
-        else: status = 'extra'
-    return {'match_status': status, 'tmdb_status': tmdb_status,
-            'local_total': local_total, 'tmdb_total': tmdb_total, 'declared_total': declared_total,
-            'diff': local_total - tmdb_total, 'seasons': season_diff}
+    return {'match_status': cls['status'], 'status_cn': cls['label'],
+            'missing_ranges': cls['missing_ranges'], 'extra_total': len(cls['extra']),
+            'manual_done': bool(cls.get('manual_done')),
+            'tmdb_status': cls.get('tmdb_status') or '',
+            'local_total': local_total,
+            'tmdb_total': (tmdb_info or {}).get('total_episodes') or 0,
+            'declared_total': (tmdb_info or {}).get('declared_total') or 0,
+            'diff': local_total - ((tmdb_info or {}).get('total_episodes') or 0),
+            'seasons': season_diff}
+
+
+def _aired_per_season(tmdb_info):
+    """已播集按季计数（用于逐季明细行）：优先真 TMDB 响应的 aired 集合；
+    fake 形态直接数 seasons[].episode_count。"""
+    from . import facts as _facts
+    if not tmdb_info:
+        return {}
+    if 'aired' in tmdb_info:
+        counts = {}
+        for k in _facts._as_keys(tmdb_info.get('aired')):
+            pair = _facts.parse_ep_key(k)
+            if pair:
+                counts[pair[0]] = counts.get(pair[0], 0) + 1
+        return counts
+    return {int(s['season_number']): int(s.get('episode_count') or 0)
+            for s in (tmdb_info.get('seasons') or [])
+            if s.get('season_number') is not None and int(s.get('season_number') or 0) > 0}
 
 def _emby_series_ids_by_tmdb(series_tmdb_id, fallback_id=None):
     """按 TMDB ID 找 Emby Series 条目 ID 列表（薄包装 media.series_ids_by_tmdb）。

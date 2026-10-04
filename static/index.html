@@ -3437,11 +3437,12 @@ function md_sync(series, base){
   series.forEach(function(x){
     var ti = x.tmdb_info; if (!ti) return;
     if (set[x.id]) {
-      if (!x._mdOrig && (ti.match_status === 'missing' || ti.match_status === 'ongoing')) x._mdOrig = { st: ti.match_status, diff: ti.diff };
+      if (!x._mdOrig && (ti.match_status === 'missing' || ti.match_status === 'ongoing' || ti.match_status === 'ongoing_lagging')) x._mdOrig = { st: ti.match_status, diff: ti.diff };
       if (x._mdOrig) {
         st[x._mdOrig.st] = Math.max(0, (st[x._mdOrig.st] || 0) - 1);
-        st.aligned = (st.aligned || 0) + 1;
-        ti.match_status = 'aligned'; ti.diff = 0; x._md = true;
+        var doneKey = (ti.match_status === 'aligned' || ti.match_status === 'complete') ? ti.match_status : 'complete';
+        st[doneKey] = (st[doneKey] || 0) + 1;
+        ti.match_status = doneKey; ti.diff = 0; x._md = true;
       }
     } else if (x._mdOrig) {
       ti.match_status = x._mdOrig.st; ti.diff = x._mdOrig.diff; delete x._mdOrig; x._md = false;
@@ -3670,7 +3671,8 @@ function renderEmbyList(){
   arr = catApply(arr);
     if (keyword) arr = arr.filter(function(x){ return (x.name||'').toLowerCase().indexOf(keyword) >= 0; });
   if (!arr.length) { embyView = { arr: [], fn: null }; updateEmbyLoadMore(0); list.innerHTML = '<div class="list-empty">' + (embyFilterState.cat ? '没有匹配「' + esc(embyFilterState.cat) + '」的条目（若一直为空，说明 Emby 数据里没有分类/路径字段）' : '无匹配项') + '</div>'; return; }
-  var prio = { missing: 0, extra: 1, unmatched: 2, no_tmdb: 2, ongoing: 3, aligned: 4 };
+  /* S1 六态排序：缺集/在更·落后最前（落后也是缺），超层次之，未匹配，在更，完整最后；旧值 aligned 兼容 */
+  var prio = { missing: 0, ongoing_lagging: 1, extra: 2, unmatched: 3, no_tmdb: 3, ongoing: 4, complete: 5, aligned: 5 };
   arr.sort(function(a, b){
     var sa = (a.tmdb_info || {}).match_status || 'unmatched';
     var sb = (b.tmdb_info || {}).match_status || 'unmatched';
@@ -3702,10 +3704,15 @@ function renderSeriesCard(s){
   var mst = ti.match_status || 'unmatched';
 
   var statusText = '', statusCls = 'no';
-  if (mst === 'aligned')        { statusText = '✓ 对齐'; statusCls = 'ok'; }
-  else if (mst === 'missing')   { statusText = '缺 ' + Math.abs(ti.diff || 0) + ' 集'; statusCls = 'local'; }
-  else if (mst === 'extra')     { statusText = '超 ' + (ti.diff || 0) + ' 集'; statusCls = 'share'; }
+  /* S1 中文六态：complete/missing/extra/ongoing/ongoing_lagging/unmatched；
+     旧缓存的 aligned 与 pending/no_tmdb 兼容展示。在更·落后（D3）单独一档，
+     缺集文案优先用后端精确集号区间（missing_ranges）。 */
+  if (mst === 'complete' || mst === 'aligned')
+                                { statusText = '✓ 完整'; statusCls = 'ok'; }
+  else if (mst === 'missing')   { statusText = '缺 ' + (ti.missing_ranges || (Math.abs(ti.diff || 0) + ' 集')); statusCls = 'local'; }
+  else if (mst === 'extra')     { statusText = '超 ' + (ti.extra_total || (ti.diff || 0)) + ' 集'; statusCls = 'share'; }
   else if (mst === 'ongoing')   { statusText = '⏳ 在更'; statusCls = 'ok'; }
+  else if (mst === 'ongoing_lagging') { statusText = '⏳ 在更·落后 ' + (ti.missing_ranges || (Math.abs(ti.diff || 0) + ' 集')); statusCls = 'local'; }
   else if (mst === 'unmatched') { statusText = '未匹配'; statusCls = 'no'; }
   else if (mst === 'no_tmdb')   { statusText = '无 TMDB'; statusCls = 'no'; }
   else if (mst === 'pending')   { statusText = '待对照'; statusCls = 'no'; }
@@ -3855,10 +3862,11 @@ function showEmbyDetailById(id){
   else if (s.in_local) html += '<span class="emby-badge loc">Emby</span>';
   else if (s.in_share) html += '<span class="emby-badge shr">分享</span>';
   if (s._md) html += '<span class="emby-badge ok">✓ 手动完结</span>';
-  else if (mst === 'aligned') html += '<span class="emby-badge ok">✓ 对齐</span>';
-  else if (mst === 'missing') html += '<span class="emby-badge miss">缺 ' + Math.abs(ti.diff || 0) + ' 集</span>';
-  else if (mst === 'extra') html += '<span class="emby-badge extra">超 ' + (ti.diff || 0) + ' 集</span>';
+  else if (mst === 'complete' || mst === 'aligned') html += '<span class="emby-badge ok">✓ 完整</span>';
+  else if (mst === 'missing') html += '<span class="emby-badge miss">缺 ' + (ti.missing_ranges || (Math.abs(ti.diff || 0) + ' 集')) + '</span>';
+  else if (mst === 'extra') html += '<span class="emby-badge extra">超 ' + (ti.extra_total || (ti.diff || 0)) + ' 集</span>';
   else if (mst === 'ongoing') html += '<span class="emby-badge ongoing">在更</span>';
+  else if (mst === 'ongoing_lagging') html += '<span class="emby-badge miss">在更·落后 ' + (ti.missing_ranges || (Math.abs(ti.diff || 0) + ' 集')) + '</span>';
   else if (mst === 'unmatched') html += '<span class="emby-badge dim">未匹配</span>';
   else if (mst === 'no_tmdb') html += '<span class="emby-badge dim">无 TMDB</span>';
   else if (mst === 'pending') html += '<span class="emby-badge gen">待对照</span>';
@@ -3921,7 +3929,7 @@ function showEmbyDetailById(id){
   var embyHost = (window.__embyHost || '').replace(/\/+$/, '');
   html += '<div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">';
   if (s._md) html += '<button class="btn gray" onclick="toggleManualDone(' + jsarg(s.id) + ')">取消完结</button>';
-  else if (mst === 'missing' || mst === 'ongoing') html += '<button class="btn" onclick="toggleManualDone(' + jsarg(s.id) + ')">手动完结</button>';
+  else if (mst === 'missing' || mst === 'ongoing' || mst === 'ongoing_lagging') html += '<button class="btn" onclick="toggleManualDone(' + jsarg(s.id) + ')">手动完结</button>';
   html += '<button class="btn red" onclick="deleteSeriesFromLib(' + jsarg(s.id) + ',\'local\',' + jsarg(s.name || '') + ')">删除本地库</button>';
   html += '<button class="btn red" onclick="deleteSeriesFromLib(' + jsarg(s.id) + ',\'share\',' + jsarg(s.name || '') + ')">删除分享库</button>';
   if (s.id && embyHost) {

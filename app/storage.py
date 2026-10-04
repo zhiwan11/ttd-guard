@@ -131,6 +131,16 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     payload TEXT NOT NULL,
     updated_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS media_facts (
+    fact_key TEXT PRIMARY KEY,
+    media_type TEXT NOT NULL,
+    tmdb_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    source TEXT NOT NULL DEFAULT 'emby'
+);
+CREATE INDEX IF NOT EXISTS idx_media_facts_updated ON media_facts(updated_at);
 """
 
 
@@ -655,6 +665,63 @@ def db_dedup_seen(key):
     except _ERRORS as e:
         _warn('dedup_seen', e)
         return False
+
+
+# ═══════════════════ 事实层（S1：media_facts） ═══════════════════
+
+def db_fact_put(fact_key, media_type, tmdb_id, payload, source='emby'):
+    """写入/覆盖一条媒体事实（payload 由调用方序列化为 JSON 安全结构）。失败返回 False。"""
+    try:
+        _execute('INSERT OR REPLACE INTO media_facts (fact_key, media_type, tmdb_id, payload, updated_at, source)'
+                 ' VALUES (?,?,?,?,?,?)',
+                 (str(fact_key), str(media_type), str(tmdb_id),
+                  payload if isinstance(payload, str) else _dumps(payload), time.time(), str(source or 'emby')))
+        return True
+    except _ERRORS as e:
+        _warn('fact_put', e)
+        return False
+
+
+def db_fact_get(fact_key):
+    """读一条事实 → {'payload': dict, 'updated_at': float, 'source': str}；没有/损坏返回 None。"""
+    try:
+        row = _execute('SELECT payload, updated_at, source FROM media_facts WHERE fact_key=?',
+                       (str(fact_key),)).fetchone()
+        if not row:
+            return None
+        try:
+            data = json.loads(row[0])
+        except ValueError as e:
+            _warn('fact_decode', e)
+            return None
+        return {'payload': data, 'updated_at': float(row[1]), 'source': str(row[2])}
+    except _ERRORS as e:
+        _warn('fact_get', e)
+        return None
+
+
+def db_facts_all(media_type=None):
+    """全部事实行（可选按 media_type 过滤），按 tmdb_id 排序。
+    元素 {'fact_key','media_type','tmdb_id','payload','updated_at','source'}。"""
+    try:
+        if media_type:
+            cur = _execute('SELECT fact_key, media_type, tmdb_id, payload, updated_at, source'
+                           ' FROM media_facts WHERE media_type=? ORDER BY tmdb_id', (str(media_type),))
+        else:
+            cur = _execute('SELECT fact_key, media_type, tmdb_id, payload, updated_at, source'
+                           ' FROM media_facts ORDER BY tmdb_id')
+        out = []
+        for key, mtype, tid, payload, ts, source in cur.fetchall():
+            try:
+                data = json.loads(payload)
+            except ValueError:
+                continue
+            out.append({'fact_key': key, 'media_type': mtype, 'tmdb_id': tid,
+                        'payload': data, 'updated_at': float(ts), 'source': source})
+        return out
+    except _ERRORS as e:
+        _warn('facts_all', e)
+        return []
 
 
 # ═══════════════════ 一次性迁移（旧 JSON 文件 → 库） ═══════════════════

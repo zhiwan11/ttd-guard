@@ -228,6 +228,21 @@ def _build_emby_library_overview():
         })
     return out
 
+def _cn_status(raw):
+    """兼容读状态：旧缓存里的英文四态（aligned/missing/extra/ongoing）与内部旧别名
+    统一映射成 S1 分类口径的内部键（complete/missing/extra/ongoing/ongoing_lagging/
+    unmatched）。新缓存直接是六态键，原样通过。"""
+    return {'aligned': 'complete', 'no_tmdb': 'unmatched'}.get(raw, raw)
+
+def _stat_bucket(st):
+    """把六态状态归进既有统计桶（桶键名 aligned/missing/… 是 Web 统计卡的既有
+    结构，保持不变；在更·落后按 D3 单独一桶，不算进缺集也不算在更）。
+    旧缓存里尚未被 _cn_status 规范化的 aligned/no_tmdb/pending 也直接放行。"""
+    return {'complete': 'aligned', 'missing': 'missing', 'extra': 'extra',
+            'ongoing': 'ongoing', 'ongoing_lagging': 'ongoing_lagging',
+            'unmatched': 'unmatched', 'aligned': 'aligned',
+            'no_tmdb': 'unmatched', 'pending': 'unmatched'}.get(st, 'unmatched')
+
 def read_manual_done() -> dict:
     """人工标记「已完结」的剧集：Emby 条目 id → {name, ts}。
     TMDB 季数 / 集数与实际不符（如国产剧只有一季而 TMDB 有很多季）时手动标记，
@@ -236,15 +251,21 @@ def read_manual_done() -> dict:
     return data if isinstance(data, dict) else {}
 
 def _apply_manual_done_to_series(series):
-    """统一应用手动完结标记，并返回不修改原对象的健康统计。"""
+    """统一应用手动完结标记，并返回不修改原对象的健康统计。
+
+    S1 起手动完结的「权威应用点」在 facts.classify（§5.3：只在一个地方应用）；
+    这里是对**历史缓存行**的等价展示修正（行内 tmdb_info 由旧口径落盘，分类结果
+    已冻结），新产出的 tmdb_info 由 classify_series_by_tmdb(manual_done=…) 直接携带
+    manual_done。"""
     done = read_manual_done()
     rows = []
     for src in series or []:
         s = dict(src)
         ti = dict(s.get('tmdb_info') or {})
         ids = [str(x) for x in (s.get('series_ids') or [s.get('id')]) if x]
-        if any(x in done for x in ids) and ti.get('match_status') in ('missing', 'ongoing'):
-            ti['match_status'] = 'aligned'
+        if any(x in done for x in ids) and _cn_status(ti.get('match_status')) in ('missing', 'ongoing', 'ongoing_lagging'):
+            ti['match_status'] = 'complete'
+            ti['status_cn'] = '完整'
             ti['manual_done'] = True
         s['tmdb_info'] = ti
         s['_md'] = bool(ti.get('manual_done'))
@@ -261,11 +282,11 @@ def build_library_health_snapshot(max_age=1800):
     movies = data.get('movies') or []
     stats = {'total_series': len(series), 'total_movies': len(movies),
              'aligned': 0, 'missing': 0, 'extra': 0, 'ongoing': 0,
-             'unmatched': 0, 'no_tmdb': 0, 'manual_done': 0}
+             'ongoing_lagging': 0, 'unmatched': 0, 'no_tmdb': 0, 'manual_done': 0}
     top = []
     for s in series:
-        st = (s.get('tmdb_info') or {}).get('match_status', 'unmatched')
-        if st in stats: stats[st] += 1
+        st = _cn_status((s.get('tmdb_info') or {}).get('match_status', 'unmatched'))
+        if (b := _stat_bucket(st)) in stats: stats[b] += 1
         if s.get('_md'): stats['manual_done'] += 1
         if st == 'missing':
             ti = s.get('tmdb_info') or {}
@@ -321,12 +342,13 @@ def unified_health(max_age=1800):
             movies = cached.get('movies') or []
             stats = {'total_series': len(series), 'total_movies': len(movies),
                      'aligned': 0, 'missing': 0, 'extra': 0, 'ongoing': 0,
-                     'unmatched': 0, 'no_tmdb': 0, 'manual_done': 0}
+                     'ongoing_lagging': 0, 'unmatched': 0, 'no_tmdb': 0, 'manual_done': 0}
             top = []
             for row in series:
-                st = (row.get('tmdb_info') or {}).get('match_status', 'unmatched')
-                if st in stats:
-                    stats[st] += 1
+                st = _cn_status((row.get('tmdb_info') or {}).get('match_status', 'unmatched'))
+                b = _stat_bucket(st)
+                if b in stats:
+                    stats[b] += 1
                 if row.get('_md'):
                     stats['manual_done'] += 1
                 if st == 'missing':
@@ -389,12 +411,11 @@ def gap_report(max_age=30 * 60, force_refresh=False, cache_only=False):
     series = _apply_manual_done_to_series(data.get('series') or [])
     save_library_snapshot(build_library_health_snapshot(max_age=max_age))
     stats = {'total': len(series), 'aligned': 0, 'missing': 0, 'extra': 0,
-             'ongoing': 0, 'unmatched': 0}
+             'ongoing': 0, 'ongoing_lagging': 0, 'unmatched': 0}
     missing = []
     for s_ in series:
-        st = (s_.get('tmdb_info') or {}).get('match_status', 'unmatched')
-        if st == 'no_tmdb': st = 'unmatched'
-        if st in stats: stats[st] += 1
+        st = _cn_status((s_.get('tmdb_info') or {}).get('match_status', 'unmatched'))
+        if (b := _stat_bucket(st)) in stats: stats[b] += 1
         if st == 'missing': missing.append(s_)
     missing.sort(key=lambda x: (x.get('tmdb_info') or {}).get('diff') or 0)  # diff 为负，越小缺得越多
     return {'status': 'success', 'missing': missing, 'stats': stats,
@@ -457,19 +478,20 @@ def action_emby_library(args):
     for s in series:
         ti = s.get('tmdb_info') or {}
         ids = [str(x) for x in (s.get('series_ids') or [s.get('id')]) if x]
-        if any(x in done for x in ids) and ti.get('match_status') in ('missing', 'ongoing'):
+        if any(x in done for x in ids) and _cn_status(ti.get('match_status')) in ('missing', 'ongoing', 'ongoing_lagging'):
             ti = dict(ti)
-            ti['match_status'] = 'aligned'
+            ti['match_status'] = 'complete'
+            ti['status_cn'] = '完整'
             ti['diff'] = 0
             s['tmdb_info'] = ti
             s['_md'] = True
     stats = {'total_series': len(series), 'total_movies': len(movies),
-             'aligned': 0, 'missing': 0, 'extra': 0, 'ongoing': 0, 'unmatched': 0, 'no_tmdb': 0,
-             'complete_series': 0, 'incomplete_series': 0}
+             'aligned': 0, 'missing': 0, 'extra': 0, 'ongoing': 0, 'ongoing_lagging': 0,
+             'unmatched': 0, 'no_tmdb': 0, 'complete_series': 0, 'incomplete_series': 0}
     for s in series:
-        st = (s.get('tmdb_info') or {}).get('match_status', 'unmatched')
-        if st in stats: stats[st] += 1
-        if s.get('complete') or st == 'aligned': stats['complete_series'] += 1
+        st = _cn_status((s.get('tmdb_info') or {}).get('match_status', 'unmatched'))
+        if (b := _stat_bucket(st)) in stats: stats[b] += 1
+        if s.get('complete') or _stat_bucket(st) == 'aligned': stats['complete_series'] += 1
         else: stats['incomplete_series'] += 1
     result = {'status': 'success', 'stats': stats, 'series': series, 'movies': movies,
               'tmdb_errors': tmdb_errors, 'emby_host': state.EMBY_HOST}
@@ -612,15 +634,16 @@ def _recompute_mapping_stats(data: dict):
     stats = (data or {}).setdefault('stats', {})
     stats.update({
         'total_series': len(series),
-        'aligned': 0, 'missing': 0, 'extra': 0, 'ongoing': 0,
+        'aligned': 0, 'missing': 0, 'extra': 0, 'ongoing': 0, 'ongoing_lagging': 0,
         'unmatched': 0, 'no_tmdb': 0, 'complete_series': 0,
         'incomplete_series': 0,
     })
     for s in series:
-        st = (s.get('tmdb_info') or {}).get('match_status', 'unmatched')
-        if st in stats:
-            stats[st] += 1
-        if s.get('complete') or st == 'aligned':
+        st = _cn_status((s.get('tmdb_info') or {}).get('match_status', 'unmatched'))
+        b = _stat_bucket(st)
+        if b in stats:
+            stats[b] += 1
+        if s.get('complete') or b == 'aligned':
             stats['complete_series'] += 1
         else:
             stats['incomplete_series'] += 1
@@ -844,13 +867,13 @@ def _refresh_tmdb_scan():
                          (i + 1) / total * 100 if total else 100, eta)
         t.save()
         stats = {'total_series': len(series), 'total_movies': len(movies),
-                 'aligned': 0, 'missing': 0, 'extra': 0, 'ongoing': 0,
+                 'aligned': 0, 'missing': 0, 'extra': 0, 'ongoing': 0, 'ongoing_lagging': 0,
                  'unmatched': 0, 'no_tmdb': 0, 'pending': 0,
                  'complete_series': 0, 'incomplete_series': 0}
         for s_ in series:
-            st = (s_.get('tmdb_info') or {}).get('match_status', 'unmatched')
-            if st in stats: stats[st] += 1
-            if s_.get('complete'): stats['complete_series'] += 1
+            st = _cn_status((s_.get('tmdb_info') or {}).get('match_status', 'unmatched'))
+            if (b := _stat_bucket(st)) in stats: stats[b] += 1
+            if s_.get('complete') or _stat_bucket(st) == 'aligned': stats['complete_series'] += 1
             else: stats['incomplete_series'] += 1
         res = {'status': 'success', 'stats': stats, 'series': series, 'movies': movies,
                'tmdb_errors': tmdb_errors, 'with_tmdb': True, 'emby_host': state.EMBY_HOST}
