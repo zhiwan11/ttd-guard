@@ -14,6 +14,9 @@
   - 补齐缺集 → 要发「已补齐」通知，且不重复播报已通知过的集
   - 发送失败却已落盘 → 吞通知；发送成功前落盘 → 重复通知
 
+  S0 P1-A 起 send_notify=False 是只读预览（绝不落盘），断言状态写回的用例
+  一律显式走 send_notify=True（推送并记账）；预览语义在 tests/test_subscribe_s0.py。
+
 Emby / TMDB 都用假实现替换，不联网；运行方式同 tests/test_engine.py。
 """
 import os
@@ -116,12 +119,16 @@ class _Env:
         subscribe.set_subscriptions(subs)
         return False
 
-    def run(self, send_notify=False):
-        """跑一轮检查，返回第一个 update（无变化时返回 None）"""
+    def run(self, send_notify=True):
+        """跑一轮检查，返回第一个 update（无变化时返回 None）。
+
+        S0 P1-A 起默认走「推送并记账」路径（send_notify=True）：send_notify=False
+        已改为只读预览、绝不落盘，断言状态写回的用例必须显式走记账路径。
+        """
         r = engine.check_subscriptions(send_notify=send_notify)
         return r['updates'][0] if r['updates'] else None
 
-    def updates(self, send_notify=False):
+    def updates(self, send_notify=True):
         return engine.check_subscriptions(send_notify=send_notify)['updates']
 
     def state(self):
@@ -576,7 +583,11 @@ class TestExploreLiveEps:
             with engine._live_eps_lock:
                 engine._live_eps_cache.pop('CACHE_HIT_TMDB', None)
 
-    def test_emby_error_returns_none(self):
+    def test_emby_error_propagates(self):
+        # S0 P1-C：Emby 请求失败抛 EmbyError（不返回 None 冒充「查不到」），
+        # 由调用方决定提示（探索页 _one 已捕获并保留卡片原状）
+        import pytest as _pytest
+
         def boom(path, params=None, method='GET', timeout=15):
             raise RuntimeError('Emby 挂了')
 
@@ -584,8 +595,8 @@ class TestExploreLiveEps:
         emby.emby_request = boom
         state.EMBY_PATHS = engine.emby_path_map('/media/local', '/media/share')
         try:
-            # 异常不外抛；系列查不到时返回 None，由调用方回退快照
-            assert engine._emby_series_live_eps('ERR_TMDB', None, use_cache=False) is None
+            with _pytest.raises(emby.EmbyError):
+                engine._emby_series_live_eps('ERR_TMDB', None, use_cache=False)
         finally:
             emby.emby_request = old
 

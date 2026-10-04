@@ -2064,6 +2064,7 @@ function setSetGroup(g){
 }
 
 var currentPlan = null;
+var currentCleanDetail = [];   // 最近一次治理执行的逐条明细（P2 弹层「复制明细」用）
 var govData = { loc: [], shr: [], keep: [], exempt: [] };
 var currentGovFilter = 'all';
 /* 双库治理的扫描结果只存在内存里，浏览器一刷新（F5）就没了，用户经常因此
@@ -2970,6 +2971,60 @@ function showGovDetail(d){
              '<div style="margin-top:16px;text-align:right"><button class="btn gray" onclick="closeModal()">关闭</button></div>';
   openModal(html);
 }
+/* P2（白皮书 §5.7）：执行结果用应用内弹层展示，不再用 alert（超长明细在手机
+   Safari / WebView 里无法滚动、会被截断）。与「执行记录」页同一份数据源
+   （write_audit_log 已写入 SQLite + JSONL），弹层里提供「在执行记录中查看」跳转。 */
+function showCleanResultModal(r){
+  var detail = r.detail || [];
+  var warns = r.warnings || [];
+  var sum = '<div class="ing-sum">'
+    + '<span class="ing-chip"><b>' + (r.loc_cnt || 0) + '</b>释放本地</span>'
+    + '<span class="ing-chip"><b>' + (r.sh_cnt || 0) + '</b>淘汰分享</span>'
+    + '<span class="ing-chip"><b>' + (r.skipped || 0) + '</b>跳过</span>'
+    + '<span class="ing-chip"><b>' + warns.length + '</b>失败</span>'
+    + (r.refreshed != null ? '<span class="ing-chip">Emby 刷新 ' + (r.refreshed ? '✅' : '❌') + '</span>' : '')
+    + '</div>';
+  var copyBtn = detail.length
+    ? '<button class="btn sm gray" onclick="copyCleanDetail(this)">复制明细</button>'
+    : '';
+  var body = '';
+  if (detail.length) {
+    body += '<details open class="rc-det"><summary>明细 · ' + detail.length + ' 条</summary>'
+          + '<div style="max-height:45vh;overflow-y:auto;border:1px solid var(--border-strong);border-radius:8px;padding:8px 10px;margin-top:8px;user-select:text">'
+          + detail.map(function(l){ return '<div style="font-size:12px;color:var(--text-mid);padding:2px 0;word-break:break-all">' + esc(l) + '</div>'; }).join('')
+          + '</div></details>';
+  } else {
+    body += '<div class="list-empty">本次没有产生变更</div>';
+  }
+  if (warns.length) {
+    body += '<details open class="rc-det"><summary style="color:#f59e0b">失败原因 · ' + warns.length + ' 条</summary>'
+          + '<div style="max-height:24vh;overflow-y:auto;margin-top:8px;user-select:text">'
+          + warns.map(function(w){ return '<div style="font-size:12px;color:#f59e0b;padding:2px 0;word-break:break-all">' + esc(w) + '</div>'; }).join('')
+          + '</div></details>';
+  }
+  var html = '<h3>' + icon('trash') + '执行结果</h3>' + sum + body
+    + '<div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">'
+    + copyBtn
+    + '<button class="btn gray" onclick="closeModal();switchTab(\'history\')">在执行记录中查看</button>'
+    + '<button class="btn" onclick="closeModal()">关闭</button>'
+    + '</div>';
+  openModal(html);
+}
+function copyCleanDetail(btn){
+  var lines = (currentCleanDetail || []);
+  var text = '【执行结果】\n' + lines.join('\n');
+  function done(){ btn.textContent = '已复制'; setTimeout(function(){ btn.textContent = '复制明细'; }, 1500); }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, function(){ fallbackCopy(text); done(); });
+  } else { fallbackCopy(text); done(); }
+}
+function fallbackCopy(text){
+  var ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } catch(e){}
+  document.body.removeChild(ta);
+}
 async function runClean(){
   if (!currentPlan) return toast('请先扫描双库', 'error');
   if (govPlanExpireAt && Date.now() > govPlanExpireAt){ expireGovPlan(); return toast('清单已过期，请重新扫描', 'error', 4000); }
@@ -2979,8 +3034,8 @@ async function runClean(){
     var res = await api('/api/clean', { method: 'POST', body: JSON.stringify({ plan_id: currentPlan, dry_run: false }) });
     var t = await pollTask(res.task_id, '执行清理中...');
     if (t.status !== 'success') throw new Error(t.error || '执行失败');
-    var lines = (t.result.detail || []).join('\n');
-    alert('【执行结果】\n\n' + lines + '\n\n释放本地: ' + t.result.loc_cnt + '  淘汰分享: ' + t.result.sh_cnt);
+    currentCleanDetail = t.result.detail || [];
+    showCleanResultModal(t.result);
     currentPlan = null;
     clearGovStateSession();
     loadDashboard();
@@ -3278,7 +3333,8 @@ async function toggleSubscribe(tmdbId, title, poster){
     toast('已订阅《' + title + '》', 'success');
   }
   try {
-    await api('/api/subscriptions', { method: 'POST', body: JSON.stringify({ subscriptions: currentSubs }) });
+    var r = await api('/api/subscriptions', { method: 'POST', body: JSON.stringify({ subscriptions: currentSubs }) });
+    if (r.warning) toast(r.warning, 'error', 5000);
     loadExplore();
   } catch(e){ toast('保存失败: ' + e.message, 'error'); }
 }
@@ -4089,11 +4145,25 @@ async function loadSubscriptions(){
         var subTot = s.tmdb_declared || s.tmdb_total;
         var tmdbExtra = subTot ? ' · TMDB ' + subTot + ' 集' : '';
         var st = s.tmdb_status ? ' · ' + s.tmdb_status : '';
+        /* P1-B：卡片「最新集」显示 Emby 实时现状 + 数据时间；记账值「已通知到 SxxExx」
+           降为单独一行小字。取数失败显示 ⚠️ 告警（P1-C），不用记账值冒充现状。 */
+        var live;
+        if (s.data_error) {
+          live = '<div class="meta" style="color:#f59e0b">⚠️ Emby 现状获取失败：' + esc(s.data_error) + '</div>';
+        } else {
+          live = '<div class="meta">最新集: <code>' + esc(s.live_ep || '未入库') + '</code>'
+               + (s.live_eps != null ? ' · 共 ' + s.live_eps + ' 集' : '')
+               + tmdbExtra + st
+               + (s.data_time ? '<span style="color:#9ca3af"> · 数据 ' + esc(s.data_time) + '</span>' : '') + '</div>';
+        }
+        var notified = s.notified_ep
+          ? '<div style="font-size:11px;color:#9ca3af;margin-top:2px">已通知到 ' + esc(s.notified_ep) + (s.updated_at ? ' · ' + esc(s.updated_at) : '') + '</div>'
+          : '';
         return '<div class="sub-item">'
           + '<div class="p">' + poster + '</div>'
           + '<div class="body">'
           + '<div class="name">' + esc(s.name) + '</div>'
-          + '<div class="meta">最新集: <code>' + (s.latest_ep || '未检查') + '</code>' + tmdbExtra + st + '</div>'
+          + live + notified
           + '</div>'
           + '<div class="actions">'
           + '<button class="btn sm ' + (s.enabled ? 'green' : 'gray') + '" onclick="toggleSubEnabled(' + i + ')">' + (s.enabled ? '启用' : '暂停') + '</button>'
@@ -4118,7 +4188,8 @@ async function saveSubSettings(){
 async function toggleSubEnabled(i){
   currentSubs[i].enabled = !currentSubs[i].enabled;
   try {
-    await api('/api/subscriptions', { method: 'POST', body: JSON.stringify({ subscriptions: currentSubs }) });
+    var r = await api('/api/subscriptions', { method: 'POST', body: JSON.stringify({ subscriptions: currentSubs }) });
+    if (r.warning) toast(r.warning, 'error', 5000);
     loadSubscriptions();
   } catch(e){ toast(e.message, 'error'); }
 }
@@ -4126,7 +4197,8 @@ async function removeSub(i){
   if (!(confirm('删除订阅《' + currentSubs[i].name + '》？'))) return;
   currentSubs.splice(i, 1);
   try {
-    await api('/api/subscriptions', { method: 'POST', body: JSON.stringify({ subscriptions: currentSubs }) });
+    var r = await api('/api/subscriptions', { method: 'POST', body: JSON.stringify({ subscriptions: currentSubs }) });
+    if (r.warning) toast(r.warning, 'error', 5000);
     loadSubscriptions();
   } catch(e){ toast(e.message, 'error'); }
 }
@@ -4134,24 +4206,35 @@ async function checkSubsNow(){
   toast('正在检查...');
   try {
     var r = await api('/api/subscriptions/check', { method: 'POST' });
-    if (r.status !== 'success') throw new Error(r.message || '失败');
+    /* P1-C：Emby 断开 / Key 未配置 → 后端返回 {ok:false, reason}，显式报错不冒充「无变化」 */
+    if (r.status !== 'success') throw new Error(r.reason || r.message || '失败');
     var ups = r.updates || [];
-    if (!ups.length) {
-      toast('检查完成：暂无变化', 'success');
+    var errs = r.errors || [];
+    if (r.sent === false) toast('⚠️ Telegram 推送失败，本轮未记账，下次检查会重试', 'error', 4000);
+    else if (!ups.length && !errs.length) toast('检查完成：暂无变化', 'success');
+    else if (ups.length) toast('发现 ' + ups.length + ' 部变化', 'success');
+    if (!ups.length && !errs.length) {
       $('subUpdatesPanel').style.display = 'none';
     } else {
-      toast('发现 ' + ups.length + ' 部变化', 'success');
       $('subUpdatesPanel').style.display = '';
-      $('subUpdates').innerHTML = ups.map(function(u){
+      var html = '';
+      /* 失败卡与变化卡视觉分离：失败不冒充「无变化」，也说明本轮未记账的影响 */
+      errs.forEach(function(e){
+        html += '<div class="list-item exempt"><div class="t">⚠️ 《' + esc(e.name || e.sid || '?') + '》检查失败</div>'
+              + '<div class="d">' + esc(e.message || '') + '（该订阅本轮未记账，下一轮重试）</div></div>';
+      });
+      ups.forEach(function(u){
         var parts = ['📺 《' + esc(u.name) + '》'];
-        if (u.new_ep) parts.push('🆕 ' + esc(u.new_ep.old) + ' → <b>' + esc(u.new_ep.new) + '</b>');
-        if (u.missing) parts.push('⚠️ 缺 ' + esc(String(u.missing.diff)) + ' 集（TMDB 已播 ' + esc(String(u.missing.tmdb_total)) + '）');
-        return '<div class="list-item exempt"><div class="t">' + parts[0] + '</div>'
-          + '<div class="d">' + parts.slice(1).join(' · ') + '</div></div>';
-      }).join('');
+        if (u.new_eps && u.new_eps.length) parts.push('🆕 新增 ' + esc(u.new_eps.join(', ')));
+        if (u.newly_missing && u.newly_missing.length) parts.push('⚠️ 新缺 ' + esc(u.newly_missing.join(', ')));
+        if (u.refilled && u.refilled.length) parts.push('✅ 已补齐 ' + esc(u.refilled.join(', ')));
+        html += '<div class="list-item exempt"><div class="t">' + parts[0] + '</div>'
+              + '<div class="d">' + parts.slice(1).join(' · ') + '</div></div>';
+      });
+      $('subUpdates').innerHTML = html;
     }
     loadSubscriptions();
-  } catch(e){ toast('检查失败: ' + e.message, 'error'); }
+  } catch(e){ toast('检查失败: ' + e.message, 'error', 4000); }
 }
 
 /* ═══════════ 每日晨报 ═══════════ */

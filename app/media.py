@@ -11,6 +11,9 @@ Limit、幽灵过滤与库归属口径互不相同，导致同一部剧在三个
 - ``live_episodes()`` / ``series_live()``：某剧当前分集（15 秒微缓存），统一库归属与幽灵过滤；
 - ``tmdb_aired_map()`` / ``tmdb_totals()``：已播 / 标称集数的唯一计算口径。
 
+错误口径（S0 P1-C）：Emby 不可达 / Key 未配置 / 请求失败统一抛 ``emby.EmbyError``，
+不返回空集合冒充「没有」；调用方决定怎么提示。
+
 只依赖 state / emby / lib 三个叶子模块，不反向依赖订阅、晨报等业务模块，避免导入环。
 """
 import time, threading, logging
@@ -74,8 +77,9 @@ def library_items(kind):
         }) or {}
         items = data.get('Items') or []
     except Exception as e:
-        log.warning('Emby %s 清单拉取失败: %s', kind, e)
-        return []
+        # P1-C 取数失败显式化：Emby 挂了 / Key 未配置不再返回 [] 冒充「空库」，
+        # 让调用方拿到 EmbyError 决定怎么提示（白皮书 §5.1）
+        raise emby.EmbyError(f'Emby {kind} 清单拉取失败: {e}') from e
     with _lib_lock:
         _lib_cache[kind] = {'ts': time.time(), 'data': items}
     return items
@@ -130,8 +134,8 @@ def live_episode_items(series_id):
         }) or {}
         items = data.get('Items') or []
     except Exception as e:
-        log.warning('实时分集拉取失败 series=%s: %s', series_id, e)
-        return []
+        # 同上：失败抛 EmbyError，不返回 [] 冒充「这部剧没有分集」
+        raise emby.EmbyError(f'Emby 实时分集拉取失败 series={series_id}: {e}') from e
     return [ep for ep in items if not is_ghost(ep.get('Path') or '')]
 
 
@@ -190,7 +194,9 @@ def _series_items_by_tmdb(tmdb_id, fallback_id=None):
         items = [it for it in (data.get('Items') or [])
                  if it.get('Id') and _pid(it) == want]
     except Exception as e:
-        log.warning('实时集数：Series 精确查询失败 %s: %s', want, e)
+        # 精确查询失败（Emby 不可达等）抛 EmbyError：不能把它当成「没查到」
+        # 继续走磁盘兜底，否则 Emby 故障会被误报成「未入库」
+        raise emby.EmbyError(f'Emby Series 精确查询失败 {want}: {e}') from e
     if not items:
         disk_lookup = lib._disk_tmdb_lookup()
         items = [it for it in library_items('Series')

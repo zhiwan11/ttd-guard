@@ -485,8 +485,12 @@ def _act_logs(token, chat_id, message_id=None, user_msg_id=None, arg=''):
 def _act_sub(token, chat_id, message_id=None, user_msg_id=None, arg=''):
     if (arg or '').lower() in ('check', 'now', '立即'):
         _send(token, chat_id, '⏳ 正在检查订阅（含 TMDB 对照）...')
+        # /sub check 会把检查结果回显给你 = 调用方自行送达（白皮书 §5.4 修复1）：
+        # self_delivered=True 只算不落盘，回显消息发送成功后由 _render_sub_check
+        # 调 commit_sub_check 记账；回显失败则下一轮重新播报（不吞通知）。
         _spawn_and_watch('sub_check',
-                         lambda _a: subscribe.check_subscriptions(send_notify=False), chat_id)
+                         lambda _a: subscribe.check_subscriptions(send_notify=False, self_delivered=True),
+                         chat_id)
     else:
         subs = subscribe.get_subscriptions()
         sub_state = subscribe.load_sub_state()
@@ -592,8 +596,19 @@ def _render_gap(token, chat_id, res, message_id=None, user_msg_id=None):
 
 
 def _render_sub_check(token, chat_id, res, message_id=None, user_msg_id=None):
-    _send(token, chat_id, str(tgmsg_reports.sub_check(res.get('updates') or [],
-                                                      res.get('total', 0))))
+    text = str(tgmsg_reports.sub_check(res.get('updates') or [],
+                                       res.get('total', 0),
+                                       res.get('errors') or []))
+    try:
+        r = _send(token, chat_id, text)
+    except Exception as e:
+        log.warning('/sub check 回显发送失败: %s', e)
+        r = None
+    if not (r and r.get('ok')):
+        log.warning('/sub check 回显未送达，本轮不记账，下次检查重试')
+        return
+    # 自己送达了才可记账：回显成功后才把 staged 落盘（白皮书 §5.4 修复1）
+    subscribe.commit_sub_check(res.get('staged') or {})
 
 
 def _render_morning(token, chat_id, res, message_id=None, user_msg_id=None):

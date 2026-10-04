@@ -157,22 +157,87 @@ _CHECK_LOCK = threading.Lock()
 CHECK_LOCK_TIMEOUT = 300
 
 
-def check_subscriptions(send_notify=True) -> dict:
+def check_subscriptions(send_notify=True, self_delivered=False) -> dict:
     """追更订阅检查入口：全局串行化，避免定时 / 网页 / bot 同时检查重复推送。
 
     第二个调用者最多等 CHECK_LOCK_TIMEOUT 秒；拿到锁后基于第一个调用者已保存的
     状态重新计算，通常得到「无变化」，因此不会重复发通知。等待超时返回 status='busy'。
+
+    「发送」与「记账」是两个正交开关（白皮书 §5.4 修复1）：
+      - send_notify=True：把更新推送到 Telegram，**发送成功才记账**；发送失败本轮
+        回退，下一轮自动重试；
+      - send_notify=False + self_delivered=True：调用方显式声明「结果已自行送达」
+        （Bot /sub check 把结果回显给你）——本轮只算不落盘，返回值带 ``staged``，
+        调用方在实际送达成功后调 ``commit_sub_check()`` 记账；
+      - send_notify=False + self_delivered=False（默认）：只读预览，不推送、绝不落盘。
     """
     if not _CHECK_LOCK.acquire(timeout=CHECK_LOCK_TIMEOUT):
         log.warning('追更订阅检查繁忙：等待超过 %d 秒，本轮跳过', CHECK_LOCK_TIMEOUT)
-        return {'updates': [], 'total': 0, 'status': 'busy'}
+        return {'updates': [], 'total': 0, 'status': 'busy', 'checked': 0, 'errors': []}
     try:
-        return _run_subscription_check(send_notify)
+        return _run_subscription_check(send_notify, self_delivered)
     finally:
         _CHECK_LOCK.release()
 
 
-def _run_subscription_check(send_notify=True) -> dict:
+def commit_sub_check(staged: dict) -> bool:
+    """把一次「已自行送达」的订阅检查结果落盘（Bot /sub check 回显发送成功后调用）。
+
+    ``check_subscriptions(self_delivered=True)`` 只算不写；调用方确认自己已经把结果
+    发出去之后，用这里把 staged 状态合并进订阅状态 —— 「自己送达了才可记账」。
+    回显发送失败时不调用，下一轮检查会把同一批集再报一遍（不吞通知）。
+    """
+    if not staged:
+        return False
+    state = _load_sub_state()
+    state.update(staged)
+    _save_sub_state(state)
+    return True
+
+
+def seed_new_subscriptions(subs: list) -> dict:
+    """新订阅播种：把当前 Emby 已有集写入 notified_episodes 作基线（防刷屏）。
+
+    保存订阅不再触发整轮检查（白皮书 §5.4 修复2），只对「新增订阅」做一次基线；
+    已有订阅的状态一律不动。播种失败的订阅没有基线，下一轮检查的状态机会把它
+    当全新订阅安静播种（不会刷屏），但基线时间点会晚于订阅时刻——所以失败必须
+    显式返回给调用方提示，而不是吞掉。
+    """
+    seeded, errors = 0, []
+    if not subs:
+        return {'seeded': seeded, 'errors': errors}
+    sub_state = _load_sub_state()
+    now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    for sub in subs:
+        sid = sub.get('id') or sub.get('tmdb_id') or sub.get('name')
+        tmdb_id = sub.get('tmdb_id')
+        if not sid or not tmdb_id:
+            continue
+        if (sub_state.get(sid) or {}).get('notified_episodes') is not None:
+            continue    # 已有基线（或旧结构待状态机迁移），不重复播种
+        try:
+            # 与检查状态机同一条身份兜底链：Emby ProviderIds → 磁盘目录名 tmdb
+            latest = _emby_series_latest_ep(tmdb_id) or _disk_series_eps(tmdb_id)
+        except emby.EmbyError as e:
+            errors.append({'sid': sid, 'name': sub.get('name') or tmdb_id, 'message': str(e)})
+            continue
+        eps = (latest or {}).get('episodes') or set()
+        keys = sorted(_eps_to_keys(eps))
+        sub_state[sid] = {
+            'tmdb_id': tmdb_id,
+            'name': (latest or {}).get('series_name') or sub.get('name'),
+            'notified_episodes': keys,
+            'missing_episodes': [],
+            'latest_ep': max(keys, key=_ep_key_num) if keys else '',
+            'updated_at': now_str,
+        }
+        seeded += 1
+    if seeded:
+        _save_sub_state(sub_state)
+    return {'seeded': seeded, 'errors': errors}
+
+
+def _run_subscription_check(send_notify=True, self_delivered=False) -> dict:
     """追更订阅检查（集合差集状态机）。
 
     核心口径（修复「吞通知 / 重复通知 / 跳集不报警」）：
@@ -182,22 +247,27 @@ def _run_subscription_check(send_notify=True) -> dict:
        求差 → ``missing_eps``。不再只看「最大集号」，所以中间插入的集也能被发现。
     2. **发送成功才记账**：``notify_telegram()`` 返回 True 后才把 ``new_eps`` 并入
        ``notified_episodes``。发送失败则状态原样不动，下一轮自动重试 —— 既不丢通知
-       也不重复刷屏。
+       也不重复刷屏。``self_delivered=True``（Bot 回显）则只算不写，由调用方在送达
+       成功后 ``commit_sub_check()``；两者都不满足时是只读预览，绝不落盘。
     3. **跳集报警**：``newly_missing``（本次新出现的缺集）与 ``refilled``（本次补齐的
        缺集）分别通知，提示精确到集号区间。
     4. **免迁移**：首次遇到只有旧 ``latest_ep`` 的订阅时，把它当成「已通知过的最后一集」
        向前播种，避免升级后把全库旧集刷一遍。
+    5. **取数失败显式化（S0 P1-C）**：Emby 不可达 / Key 未配置抛 ``EmbyError``，
+       按订阅收进返回值 ``errors``（sid/name/message），不用「无变化」冒充。
     """
     cfg = _cfg.load_config()
     if cfg.get('subscribe_enabled', '1') != '1':
-        return {'updates': [], 'skipped': 'disabled'}
+        return {'updates': [], 'skipped': 'disabled', 'checked': 0, 'errors': []}
     subs = get_subscriptions()
     if not subs:
-        return {'updates': [], 'total': 0}
+        return {'updates': [], 'total': 0, 'checked': 0, 'errors': []}
 
     check_tmdb = cfg.get('subscribe_check_tmdb', '1') == '1'
     state = _load_sub_state()
     updates = []
+    errors = []   # [{'sid','name','message'}]：Emby 取数失败显式返回，不冒充「无变化」
+    checked = 0   # 本轮成功取到 Emby 数据的订阅数（区分「全部失败」与「无变化」）
     now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     # 记录每个订阅本轮「发送成功后应写回」的状态，发送前不落盘
     staged = {}
@@ -208,12 +278,19 @@ def _run_subscription_check(send_notify=True) -> dict:
         tmdb_id = sub.get('tmdb_id')
         if not tmdb_id: continue
 
-        latest = _emby_series_latest_ep(tmdb_id)
+        try:
+            latest = _emby_series_latest_ep(tmdb_id)
+        except emby.EmbyError as e:
+            errors.append({'sid': sid, 'name': sub.get('name') or tmdb_id, 'message': str(e)})
+            continue
         # Emby 的 ProviderIds.Tmdb 缺失（上游 TgtoDrive 目录名有 tmdb 但 Emby 没刮进去）
         # 时，回退到磁盘目录名 tmdb 兜底，避免追更拿不到分集而「不能用」。
+        # 注意：Emby 请求本身失败走上面的 EmbyError 分支，磁盘兜底只救「元数据缺失」，
+        # 不掩盖「Emby 不可达」。
         if not latest:
             latest = _disk_series_eps(tmdb_id)
         tmdb_info = tmdb._tmdb_series_info(tmdb_id) if check_tmdb else None
+        checked += 1
 
         # 无 Emby 数据且无 TMDB → 跳过（保持旧行为）
         if not latest and not tmdb_info: continue
@@ -291,11 +368,12 @@ def _run_subscription_check(send_notify=True) -> dict:
                 'refilled': sorted(_eps_to_keys(refilled)),
             })
 
-    # ── 发送成功才记账 ──
-    # send_notify=False（bot 手动查看 / 晨报 / 保存订阅后的即时检查）本身不发送消息，
-    # 等价于「已送达」，同样要记账，否则下一轮会把同一批集重复播报。
-    # 发送失败时：notified_episodes / missing_episodes 全部回退到本轮开始前的值，
-    # 保证下一轮算出同一批 new_eps 继续重试 —— 既不丢通知也不重复刷屏。
+    # ── 发送与记账（两个正交开关）──
+    # send_notify=True：推送 Telegram，发送成功才记账；失败时 notified_episodes /
+    # missing_episodes 回退到本轮开始前的值，下一轮算出同一批 new_eps 继续重试。
+    # self_delivered=True（Bot 回显）：本轮只算不写，staged 随返回值交给调用方，
+    # 在「实际送达成功」后由 commit_sub_check() 落盘。
+    # 都不满足：只读预览，绝不落盘。
     sent_ok = True
     if send_notify and updates:
         # 文案统一由 tgmsg 渲染（与 Bot /sub check、晨报「订阅更新」同一份实现）
@@ -319,7 +397,15 @@ def _run_subscription_check(send_notify=True) -> dict:
             st['missing_episodes'] = sorted(
                 _eps_to_keys(_keys_to_eps(st['missing_episodes']) - _keys_to_eps(u['newly_missing'])))
 
-    state.update(staged)
-    _save_sub_state(state)
+    staged_out = None
+    if self_delivered and not send_notify:
+        staged_out = staged            # 送达确认权在调用方（Bot 回显成功后 commit）
+    elif send_notify:
+        state.update(staged)           # 推送路径：失败已回退，成功照常记账
+        _save_sub_state(state)
 
-    return {'updates': updates, 'total': len(subs), 'sent': bool(sent_ok) if send_notify and updates else None}
+    out = {'updates': updates, 'total': len(subs), 'checked': checked, 'errors': errors,
+           'sent': bool(sent_ok) if send_notify and updates else None}
+    if staged_out is not None:
+        out['staged'] = staged_out
+    return out

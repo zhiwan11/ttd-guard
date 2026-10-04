@@ -194,10 +194,26 @@ def gap_card(res):
 
 
 # ═══════════════════ 订阅 ═══════════════════
-def sub_check(updates, total):
+def sub_check(updates, total, errors=None):
+    """订阅检查回显（Bot /sub check）：结果 + 取数失败明细（P1-C 失败显式化）。"""
+    errors = errors or []
+    fail_lines = []
+    if errors:
+        fail_lines.append(th.Html('<b>⚠️ %d 部检查失败</b>（本轮不记账，下次重试）' % len(errors)))
+        for e in errors[:5]:
+            fail_lines.append(th.Html('• 《%s》%s' % (th.h(e.get('name') or e.get('sid') or '?'),
+                                                      th.h(e.get('message') or ''))))
+        if len(errors) > 5:
+            fail_lines.append(th.Html('• …另有 %d 部' % (len(errors) - 5)))
     if not updates:
-        return th.Html('%s\n\n✅ 无新集、无缺集' % blocks.tg_title('🔔', '订阅检查完成', '共 %d 部' % total))
-    return th.Html('\n'.join(str(x) for x in blocks.sub_updates_lines(updates, 'check')))
+        head = '%s\n\n✅ 无新集、无缺集' % blocks.tg_title('🔔', '订阅检查完成', '共 %d 部' % total)
+        if fail_lines:
+            return th.Html(head + '\n\n' + '\n'.join(str(x) for x in fail_lines))
+        return th.Html(head)
+    body = '\n'.join(str(x) for x in blocks.sub_updates_lines(updates, 'check'))
+    if fail_lines:
+        body += '\n\n' + '\n'.join(str(x) for x in fail_lines)
+    return th.Html(body)
 
 
 def sub_notify(updates):

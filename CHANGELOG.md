@@ -11,6 +11,31 @@
 - **追更订阅 / 片库映射 / 影视探索数据口径统一**：新增统一媒体取数层 `app/media.py`，三处取数逻辑合并；修复 Emby 服务端忽略 ProviderId 导致全库 Series 误命中的缺陷；`check_subscriptions` 检查全局互斥串行化，彻底防止重复推送通知。
 - **缓存失效总线与多端自动同步**：新增 `app/sync.py` 版本总线，各入口（Web / Bot / 调度 / CLI）产生数据变更时即时失效内存缓存并原子递增对应域版本；修复缓存失效后重新载入陈旧磁盘副本的问题；前端新增页面可见性感知与 5 秒轻量同步轮询，实现多标签页与多端设备无感实时刷新，操作无冲突。
 
+### S0 止血：静默记账、失败显式化、订阅卡现状、治理结果弹层
+
+- **「发送」与「记账」拆成两个正交开关（P1-A）**：`check_subscriptions(send_notify, self_delivered)` —— 推送路径发送成功才记账（失败回滚、下一轮重试，保持 PR12 语义）；Bot `/sub check` 改传 `self_delivered=True`，本轮只算不落盘，回显消息**发送成功后**才由 `commit_sub_check()` 落盘 staged 状态（「自己送达了才可记账」，回显失败则下一轮重新播报）；两者都不满足时是只读预览，绝不写 `notified_episodes`。
+- **保存订阅不再触发检查（P1-A）**：删掉 `api_save_subs` 保存后 `check_subscriptions(send_notify=False)` 的调用点（旧实现把「预览」当「已送达」记账，且拖慢保存）；改为仅对「新增订阅」做一次播种（`seed_new_subscriptions`：把当前 Emby 已有集写入 `notified_episodes` 作基线，与检查状态机同一条 ProviderIds → 磁盘目录名身份兜底链）；播种失败返回「订阅已保存，但建立基线失败：原因」的诚实提示，此时下一轮检查会按全新订阅安静播种、不刷屏。
+- **取数失败显式化（P1-C）**：`app/media.py` 三处 `except Exception` 吞异常返回空集合改为抛 `EmbyError`（`app/emby.py` 新定义），不再把「Emby 挂了 / Key 未配置」冒充「没有」；`check_subscriptions` 返回值新增结构化 `errors`（sid/name/message）与 `checked`；「立即检查」在一部都没查成时返回 `{ok:false, reason}`；订阅卡对取数失败的剧显示 ⚠️ 告警；Telegram 回显追加「⚠️ N 部检查失败」+逐条原因。
+- **订阅卡显示 Emby 现状（P1-B）**：`api_get_subs` 逐订阅实时查 `media.series_live`，「最新集」来自实时值并带数据时间；记账值降级为单独一行小字「已通知到 SxxExx」。S1 事实层建成后切换 `facts.get_series_status`。
+- **治理执行结果改应用内弹层（P2）**：替换 `alert('【执行结果】…')`（超长明细在手机 Safari / WebView 无法滚动、会被截断）——顶部汇总（释放本地 / 淘汰分享 / 跳过 / 失败 / Emby 刷新）+ 可折叠可滚动可复制的逐条明细 + 失败原因块 + 「在执行记录中查看」跳转（与 `write_audit_log` 同一份数据）。
+- **「立即检查」前端适配**：失败卡与变化卡视觉分离；推送失败提示「本轮未记账」；变化明细改用后端真实的 `new_eps / newly_missing / refilled` 字段（旧实现引用不存在的 `new_ep / missing` 字段，渲染一直是空的）。
+- **测试基建**：`tests/conftest.py` 注入 fcntl → msvcrt 兼容垫片（生成真实 `fcntl.py` 模块文件，本进程挂 `sys.path`、子进程经 `PYTHONPATH` 继承），Windows 本地可跑全量 pytest；CI（ubuntu）不受影响。新增 `tests/test_subscribe_s0.py`。
+
+## 1.8.7
+
+### UI 修复
+
+- 手机端（≤899px）侧边栏抽屉宽度由 `min(80vw, 320px)` 收窄为 `min(68vw, 240px)`，避免大屏手机上抽屉几乎占满整屏。
+
+## 1.8.6
+
+### 晨报发送口径与片库映射补齐联动
+
+- **手动发送不再占用定时记账**：`send_morning_report` 新增 `mark_sent` 参数；网页「立即发送」传 `mark_sent=False`，一次手动测试不会把当天 08:00 的定时晨报标记成已发送；调度到点发送显式 `mark_sent=True`。
+- **立即发送不再现场扫描**：`/api/morning/send` 默认 `force=False`，与定时晨报同口径发送当前缓存；需要现场扫描用「预览（现场扫）」，API 调用方仍可显式传 `force=true`；Bot `/morning` 提示文案同步改为「读取晨报缓存并发送」。
+- **补齐缺集后片库映射自动刷新**：入库轮询发现新入库剧集时，`refresh_mapping_cache_after_ingest` 只就地刷新受影响剧集（双库 SeriesId union 实时分集、`_resync_series_entry` 重算、`_recompute_mapping_stats` 重算统计），同步内存/总览/TMDB 对照/统一快照多层缓存；不触发全量 TMDB 对照。
+- **晨报订阅块文案**：无变化时由「0」改为「✅ 无变化」。
+
 ## 1.8.5-fix1
 
 ### 片库映射缺集补齐自动刷新

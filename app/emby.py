@@ -23,6 +23,15 @@ EMBY_RETRIES = 2                                                  # 仅 GET 在�
 _MEDIA_EXT = {'.strm', '.mkv', '.mp4', '.ts', '.m2ts', '.avi', '.mov', '.wmv', '.flv', '.rmvb', '.iso'}
 
 
+class EmbyError(RuntimeError):
+    """Emby 不可达 / Key 未配置 / 请求失败，携带人类可读原因。
+
+    统一数据层（media.*）的错误出口：取数失败一律抛本异常，**绝不返回空集合
+    冒充「没有」**——那是「Emby 短暂异常把整库打成未入库」这类静默归零缺陷的
+    根源。异常由调用方决定怎么提示（转成结构化 errors、显式报错或诚实降级）。
+    """
+
+
 def emby_request(path, params=None, method='GET', timeout=None, body=None, retries=None):
     if not state.EMBY_KEY:
         raise RuntimeError('未配置 EMBY_KEY')
