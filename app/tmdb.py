@@ -12,7 +12,7 @@ from . import config as _cfg
 from . import logger
 from .core import (esc, parse_season_dir, get_ep, title_key, governance_title_key,
                    analyze_season_episodes, parse_emby_library, quality_label, RE_SXXEXX)
-from . import state, morning, emby, lib, storage, media, sync
+from . import state, emby, lib, storage, media, sync
 
 log = logging.getLogger('media_agent')
 
@@ -121,82 +121,14 @@ class Tmdb:
         _last_prune['ts'] = now
         storage.db_tmdb_prune(storage.TMDB_MAX_AGE)
 
-def _load_emby_index_disk():
-    """探索页 Emby 索引持久缓存（SQLite 文档 emby_index，结构 {'ts', 'data'}）"""
-    raw = storage.db_doc_get(storage.DOC_EMBY_INDEX)
-    if isinstance(raw, dict) and isinstance(raw.get('data'), dict):
-        try:
-            return {'ts': float(raw.get('ts', 0)), 'data': raw['data']}
-        except (TypeError, ValueError):
-            pass
-    return None
-
-def _save_emby_index_disk(data):
-    if not storage.db_doc_put(storage.DOC_EMBY_INDEX, {'ts': time.time(), 'data': data}):
-        log.warning('Emby 探索索引缓存写入失败')
-
-def _build_emby_library_index():
-    out = {}
-    disk_lookup = lib._disk_tmdb_lookup()  # 上游目录名 {tmdb-xxx} 兜底表
-    for item_type in ('Movie', 'Series'):
-        media_key = 'tv' if item_type == 'Series' else 'movie'
-        try:
-            for it in media.library_items(item_type):
-                tmdb_id = media.tmdb_id_of(it, disk_lookup)
-                if not tmdb_id: continue
-                key = f'{media_key}:{tmdb_id}'
-                path = it.get('Path', '') or ''
-                lib_tag = state.emby_lib_of(path)
-                row = out.setdefault(key, {
-                    'id': it.get('Id'), 'ids': [], 'name': it.get('Name'), 'type': it.get('Type'),
-                    'path': path, 'paths': [], 'year': it.get('ProductionYear'),
-                    'rating': it.get('CommunityRating'), 'has_image': False, 'libs': set(),
-                })
-                if it.get('Id') and it.get('Id') not in row['ids']: row['ids'].append(it.get('Id'))
-                if path and path not in row['paths']: row['paths'].append(path)
-                if lib_tag: row['libs'].add(lib_tag)
-                row['has_image'] = row['has_image'] or ('Primary' in (it.get('ImageTags') or {}))
-                if not row.get('path') and path: row['path'] = path
-        except Exception as e:
-            log.warning('Emby 索引拉取失败 (%s): %s', item_type, e)
-    for row in out.values():
-        row['libs'] = sorted(row['libs'])
-        row['in_local'] = 'local' in row['libs']
-        row['in_share'] = 'share' in row['libs']
-    return out
-
-def _emby_index_bg_refresh():
-    if not state._emby_index_refresh_lock.acquire(blocking=False): return
-    try:
-        out = _build_emby_library_index()
-        state._emby_index_cache.update({'ts': time.time(), 'data': out})
-        _save_emby_index_disk(out)
-        sync.bump('explore', invalidate=False, reason='index_refresh')
-    except Exception as e:
-        log.warning('Emby 探索索引后台刷新失败: %s', e)
-    finally:
-        state._emby_index_refresh_lock.release()
-
-def emby_library_index(force=False):
-    """探索页身份索引：内存 5 分钟 → 磁盘立即返回+后台刷新 → 首次同步构建。"""
-    if not force:
-        if state._emby_index_cache['data'] and time.time() - state._emby_index_cache['ts'] < 300:
-            return state._emby_index_cache['data']
-        disk = _load_emby_index_disk()
-        if disk:
-            state._emby_index_cache.update(disk)
-            stale = 'emby_index' in state._stale
-            state._stale.discard('emby_index')
-            if stale or time.time() - disk['ts'] >= 300:
-                threading.Thread(target=_emby_index_bg_refresh, daemon=True,
-                                 name='emby-index-refresh').start()
-            return state._emby_index_cache['data']
-    out = _build_emby_library_index()
-    state._emby_index_cache.update({'ts': time.time(), 'data': out})
-    _save_emby_index_disk(out)
-    return out
 
 def action_explore(args):
+    """S2 第一段（§5.2）：探索目录只读 TMDB，立即返回卡片，不等 Emby。
+
+    一次取 page*2-1 与 page*2 两页拼 40 张卡；卡片带 in_emby/eps 占位字段
+    （第二段 /api/explore/status 才现查 Emby 就地更新）。TMDB 失败直接报错，
+    不降级成旧缓存（§5.2 既定口径：TMDB 网络问题不在考虑范围）。
+    """
     region = getattr(args, 'region', 'all') or 'all'
     year = (getattr(args, 'year', '') or '').strip()
     sort = getattr(args, 'sort', 'popularity') or 'popularity'
@@ -237,81 +169,14 @@ def action_explore(args):
         params2 = dict(params); params2['page'] = page * 2
         res1 = t.get(tmdb_path, **params1) or {}
         res2 = t.get(tmdb_path, **params2) or {}
-        results = (res1.get('results') or []) + (res2.get('results') or [])
-        total_pages_raw = res1.get('total_pages') or 1
-        res = {
-            'results': results,
-            'total_pages': max(1, total_pages_raw // 2),
-            'total_results': res1.get('total_results', 0),
-        }
     except TmdbError as e:
+        # TMDB 失败直接报错，不降级成旧缓存（§5.2）
         return {'status': 'error', 'message': str(e)}
-
-    emby_index = emby_library_index()
-    # 探索页只读统一 TMDB 对照缓存，不为每张海报重新请求 /tv/{id}。
-    # 注意：这份快照只用来兜底「本地/分享分库集数」与「TMDB 总集数」，
-    # 剧集的实时集数由下面 _emby_series_live_eps 现查覆盖（见该函数注释）。
-    eps_map = {}; tmdb_map = {}
-    if media != 'movie':
-        try:
-            snap = morning.load_library_snapshot(max_age=1800) or morning.build_library_health_snapshot()
-            for sr in snap.get('series', []):
-                tid = str(sr.get('tmdb_id') or '')
-                if not tid: continue
-                eps_map[tid] = {'local_eps': int(sr.get('local_eps', 0) or 0),
-                                 'share_eps': int(sr.get('share_eps', 0) or 0),
-                                 'have_eps': int(sr.get('have_eps', 0) or 0)}
-                tmdb_map[tid] = dict(sr.get('tmdb_info') or {})
-        except Exception as e:
-            log.warning('探索页统一快照读取失败: %s', e)
-
-    page_items = (res.get('results') or [])[:40]
-
-    # ── 剧集实时集数：并发现查 Emby，覆盖快照里的陈旧 have_eps ──
-    # 快照有 30 分钟强制缓存，且刷新页面不会自愈；这里对每张「已入库」的剧集卡片
-    # 直接问 Emby「这部剧现在有哪些集」，逐集与本地/分享路径分库统计。
-    # 结果只覆盖集数，不改 in_emby / 海报：海报仍走索引缓存，避免多打一次请求。
-    live_eps = {}
-    live_total = {}
-    if media != 'movie':
-        targets = []
-        for item in page_items:
-            # multi 搜索结果里混着电影/剧集，只对剧集卡做实时集数
-            if (item.get('media_type') or media) != 'tv':
-                continue
-            tid = str(item.get('id', ''))
-            hit = emby_index.get('tv:' + tid)
-            if hit is not None:
-                targets.append((tid, hit.get('id')))
-        if targets:
-            def _one(target):
-                tid, eid = target
-                # TMDB 标称总集数：直接取 /tv/{id}（24h 缓存，命中即零成本），不再依赖
-                # 30 分钟的统一快照，避免「Emby 是新的、TMDB 总数是旧的」造成 18/16 这类错位。
-                try:
-                    _info = t.get(f'/tv/{tid}', ttl=TMDB_INFO_TTL) or {}
-                    _tot = sum(int(x.get('episode_count') or 0) for x in (_info.get('seasons') or [])
-                               if (x.get('season_number') or 0) > 0)
-                    if _tot > 0:
-                        live_total[tid] = _tot
-                except Exception as e:
-                    log.warning('探索页 TMDB 总集数失败 %s: %s', tid, e)
-                try:
-                    return tid, _emby_series_live_eps(tid, eid)
-                except Exception as e:
-                    log.warning('探索页实时集数失败 %s: %s', tid, e)
-                    return tid, None
-            # 单剧 1~2 次请求，8 并发足以在百毫秒级跑完 40 部；用共享池避免每次新建线程
-            try:
-                with ThreadPoolExecutor(max_workers=8) as _ex:
-                    for tid, res_live in _ex.map(_one, targets):
-                        if res_live and not res_live.get('empty'):
-                            live_eps[tid] = res_live
-            except Exception as e:
-                log.warning('探索页实时集数并发查询失败: %s', e)
+    results = (res1.get('results') or []) + (res2.get('results') or [])
+    total_pages_raw = res1.get('total_pages') or 1
 
     cards = []
-    for item in page_items:
+    for item in results:
         # multi 搜索时每张卡的类型来自 media_type（'movie'/'tv'/'person'），discover 用全局 media
         item_media = item.get('media_type') or media
         if item_media == 'person':
@@ -324,47 +189,25 @@ def action_explore(args):
         year_str = date_str[:4] if date_str else ''
         rating = item.get('vote_average') or 0
         poster = item.get('poster_path')
-        emby_hit = emby_index.get(item_media + ':' + tmdb_id)
-        in_emby = emby_hit is not None
-        in_local = bool(emby_hit and emby_hit.get('in_local'))
-        in_share = bool(emby_hit and emby_hit.get('in_share'))
-        if poster: poster_url = f'{TMDB_IMG}{poster}'
-        elif in_emby and emby_hit.get('has_image'): poster_url = f'/api/emby/poster/{emby_hit["id"]}'
-        else: poster_url = ''
-
-        # 入库进度（仅剧集）：实时集数优先，拿不到才退回统一快照
-        eps = None
-        eps_source = 'cache'
-        if item_media == 'tv' and in_emby:
-            e = eps_map.get(tmdb_id) or {'local_eps': 0, 'share_eps': 0, 'have_eps': 0}
-            tmdb_info_cached = tmdb_map.get(tmdb_id) or {}
-            # 展示口径与上游一致：优先 TMDB 标称总集数（如 18/24）；旧快照没有该字段时退回已播集数
-            tmdb_total = int(live_total.get(tmdb_id) or tmdb_info_cached.get('declared_total') or tmdb_info_cached.get('tmdb_total') or 0)
-            live = live_eps.get(tmdb_id)
-            if live:
-                e = {'local_eps': live['local_eps'], 'share_eps': live['share_eps'],
-                     'have_eps': live['have_eps']}
-                eps_source = 'live'
-            eps = {
-                'local': e['local_eps'], 'share': e['share_eps'],
-                'have': e['have_eps'], 'total': tmdb_total,
-            }
-
+        poster_url = f'{TMDB_IMG}{poster}' if poster else ''
+        # 占位字段：第二段 /api/explore/status 才现查 Emby（§5.2 两段式）
         cards.append({
             'tmdb_id': tmdb_id, 'title': title, 'year': year_str,
             'rating': round(rating, 1) if rating else None, 'poster': poster_url,
-            'in_emby': in_emby, 'in_local': in_local, 'in_share': in_share,
-            'emby_id': emby_hit['id'] if emby_hit else None,
+            'in_emby': None, 'in_local': False, 'in_share': False,
+            'emby_id': None,
             'type': item_media,
-            'eps': eps, 'eps_source': eps_source if eps else None,
+            'eps': None, 'eps_source': None,
         })
+    cards = cards[:40]
 
     t.save()
     return {'status': 'success', 'page': page,
-            'total_pages': min(res.get('total_pages', 1), 20),
-            'total_results': res.get('total_results', 0),
+            'total_pages': min(max(1, total_pages_raw // 2), 20),
+            'total_results': res1.get('total_results', 0),
             'cards': cards, 'is_search': bool(query),
             'tmdb_calls': t.calls, 'tmdb_hits': t.hits}
+
 
 def classify_series_by_tmdb(local_seasons, tmdb_info, manual_done=False):
     """按 TMDB 已播集数对照片库（S1 起为 facts.classify 的薄封装，§5.3 唯一口径）。

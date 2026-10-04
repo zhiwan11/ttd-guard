@@ -13,8 +13,9 @@ import os
 import re
 from pathlib import Path
 
-# app/routers/deps 在导入时读 WEB_PASSWORD：不设置会 SystemExit，测试进程统一给个默认值
-os.environ.setdefault('WEB_PASSWORD', 's0-test')
+# app/routers/deps 在导入时读 WEB_PASSWORD：不设置会 SystemExit，测试进程统一给个默认值。
+# 与 tests/test_main.py / tests/test_sync.py 同一密码（进程级一次性读取，文件间必须一致）。
+os.environ.setdefault('WEB_PASSWORD', 'test-pass-123')
 
 from app import config, emby, state, subscribe, tg, tmdb
 

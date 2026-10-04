@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """片库：入库 / 统计 / Emby / 搜索 / 日志 / 删除 / 探索（v1.7.7 自 main.py 拆出）"""
+import logging
 import time, json, threading, urllib.parse, urllib.request
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
 from app import config as _cfg
-from app import state, governance, wash, morning, tmdb, ingest, emby, stats, logger
+from app import state, governance, wash, morning, tmdb, ingest, emby, stats, logger, facts
 from app.routers.deps import auth, Args
 
 router = APIRouter()
@@ -95,6 +96,50 @@ def api_explore(region: str = 'all', year: str = '', sort: str = 'popularity',
                                               page=page, q=q, genre=genre))
     except Exception as e:
         return {'status': 'error', 'message': str(e)}
+
+
+EXPLORE_STATUS_MAX_IDS = 60     # 一屏最多 40 张卡，60 留余量；防恶意超长查询
+EXPLORE_STATUS_WORKERS = 8      # 与旧探索页实时集数并发度一致
+
+
+@router.get('/api/explore/status', dependencies=[Depends(auth)])
+def api_explore_status(ids: str = '', media: str = 'tv'):
+    """探索第二段（§5.2）：对当前屏的 TMDB ID 并发现查 Emby 事实，就地更新卡片。
+
+    - 有界 ThreadPoolExecutor 并发（撤回版串行 for 循环，一屏 40 卡在 Emby 慢时
+      要把用户晾十几秒）；ids 上限 60。
+    - 每卡返回 {fact, classification, data_time}（tv）或 {fact, data_time}（movie）；
+      单卡失败返回 {status:'error', tmdb_id, message}——错误与「未入库」显式区分，
+      不冒充。
+    - 手动完结标记在此读出并传给 facts.get_series_status → classify（§5.3：
+      classify 是唯一应用点；不传会把已完结的剧重新打回「缺集」）。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    id_list = [x.strip() for x in (ids or '').split(',') if x.strip()][:EXPLORE_STATUS_MAX_IDS]
+    if not id_list:
+        return {'status': 'error', 'message': 'ids 为空'}
+    if media not in ('tv', 'movie'):
+        return {'status': 'error', 'message': 'media 必须是 tv 或 movie'}
+
+    done_ids = set()
+    if media == 'tv':
+        try:
+            done_ids = {str(k) for k, _v in (morning.read_manual_done() or {}).items()}
+        except Exception as e:
+            logging.getLogger('media_agent').warning('探索第二段读取手动完结失败: %s', e)
+
+    def _one(tid):
+        try:
+            if media == 'movie':
+                return facts.get_movie_status(tid)
+            return facts.get_series_status(tid, manual_done=(tid in done_ids))
+        except Exception as e:            # EmbyFactError 及一切意外都显式化，不冒充「未入库」
+            return {'status': 'error', 'tmdb_id': tid, 'message': str(e)}
+
+    with ThreadPoolExecutor(max_workers=EXPLORE_STATUS_WORKERS) as pool:
+        data = list(pool.map(_one, id_list))
+    return {'status': 'success', 'media': media, 'data': data, 'count': len(data),
+            'data_time': time.strftime('%Y-%m-%d %H:%M', time.localtime())}
 
 
 @router.get('/api/tmdb/progress', dependencies=[Depends(auth)])

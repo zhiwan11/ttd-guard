@@ -14,7 +14,9 @@ Emby 用假实现替换（沿用 tests/test_subscriptions.py 的 _Env 手法）�
 import json
 import os
 
-os.environ.setdefault('WEB_PASSWORD', 's1-test')
+# 与 tests/test_main.py / tests/test_sync.py 同一密码：app/routers/deps 在导入时读
+# WEB_PASSWORD（进程级一次性），测试文件之间必须一致，否则 Basic 认证 401。
+os.environ.setdefault('WEB_PASSWORD', 'test-pass-123')
 
 import pytest
 

@@ -524,6 +524,8 @@ input:focus,select:focus,textarea:focus{
 .badge-status.local{background:rgba(59,130,246,.92)}
 .badge-status.share{background:rgba(88,86,214,.92)}
 .badge-status.partial{background:rgba(245,158,11,.92)}
+.badge-status.err{background:rgba(239,68,68,.92)}      /* S2：Emby 查询失败，与「未入库」视觉分离 */
+.badge-status.dim{background:rgba(148,163,184,.55)}    /* S2：第二段未返回的占位 */
 
 .poster-card .info{padding:10px 12px 12px}
 .poster-card .t{font-size:12.5px;font-weight:600;letter-spacing:-.1px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -2492,7 +2494,8 @@ function switchTab(id){
 
   if (id === 'dashboard')  loadDashboard();
   if (id === 'governance') { if (!currentPlan) restoreGovStateFromSession(); loadLatestGov(); loadGovTruth(); }
-  if (id === 'explore')    loadExplore();
+  if (id === 'explore')    { ensureExploreAutoRefresh(); loadExplore(); }
+  else if (typeof ensureExploreAutoRefresh === 'function') stopExploreAutoRefresh();
   if (id === 'settings')   { loadConfig(); loadBotStatus(); loadStrategy(); loadIngest(); loadGovAuto(); loadCoverStrategy(); }
   if (id === 'mapping')    ensureEmbyLoaded();
   if (id === 'subscribe')  loadSubscriptions();
@@ -3053,6 +3056,9 @@ async function runClean(){
 var exploreState = { region: 'all', media: 'all', year: '', sort: 'popularity', genre: '', page: 1, totalPages: 1, q: '' };
 var exploreLoading = false;
 var exploreFiltersOpen = false;
+var exploreCards = {};          // tmdb_id -> 卡片数据（第二段 /api/explore/status 就地更新用）
+var exploreStatusSeq = 0;       // 第二段请求序号：翻页/切筛选后旧响应作废
+var exploreRefreshTimer = null; // 60 秒自动刷新（D2 开）：仅页面可见且探索页激活时触发
 
 var REGION_LABEL = { all: '全部地区', cn: '大陆', hk: '香港', tw: '台湾', jp: '日本', kr: '韩国', us: '欧美' };
 var MEDIA_LABEL  = { all: '全部', movie: '电影', tv: '剧集' };
@@ -3172,6 +3178,7 @@ async function loadExplore(append){
   var grid = $('exploreGrid');
   if (!append) {
     grid.innerHTML = '<div class="list-empty">加载中...</div>';
+    exploreCards = {};              // 新一轮查询：旧卡片缓存作废
   }
   try {
     var qs = 'region=' + encodeURIComponent(exploreState.region)
@@ -3187,11 +3194,13 @@ async function loadExplore(append){
     if (append) {
       appendExploreCards(r.cards || []);
     } else {
-      renderExploreCards(r.cards || []);
+      renderExploreGrid(r.cards || []);
     }
     if (r.cards && r.cards.length) {
       var label = r.is_search ? '搜索结果' : '第 ' + exploreState.page + ' / ' + exploreState.totalPages + ' 页';
       $('explorePageInfo').textContent = label + ' · 共 ' + (r.total_results || 0) + ' 条';
+      /* S2 两段式第二段：海报已渲染，随即按 tv/movie 分两批现查 Emby 就地更新徽标 */
+      refreshExploreStatus(r.cards || []);
     }
   } catch(e){
     if (!append) {
@@ -3200,40 +3209,80 @@ async function loadExplore(append){
   } finally { exploreLoading = false; }
 }
 
-function appendExploreCards(cards){
-  var grid = $('exploreGrid');
-  var subSet = _subscribedTmdbIds();
-  var html = cards.map(function(c){
-    var st = exploreStatus(c);
-    var status = st.status, cls = st.cls, statusTip = st.tip || '';
-    var typeLabel = c.type === 'tv' ? '剧集' : '电影';
-    var posterHtml;
-    if (!c.poster) {
-      posterHtml = '<div class="no-img">暂无海报</div>';
-    } else if (c.poster.indexOf('/api/emby/poster/') === 0) {
-      posterHtml = '<img data-emby-src="' + esc(c.poster) + '" alt="" loading="lazy">';
-    } else {
-      posterHtml = '<img src="' + esc(c.poster) + '" alt="" loading="lazy" onerror="this.style.display=\'none\';this.parentNode.innerHTML=\'<div class=&quot;no-img&quot;>暂无海报</div>\'">';
-    }
-    var isSub = subSet[String(c.tmdb_id)];
-    var subBtn = c.type === 'tv'
-      ? '<button class="sub-btn ' + (isSub ? 'on' : '') + '" data-tmdb="' + esc(c.tmdb_id) + '" data-title="' + esc(c.title) + '" data-poster="' + esc(c.poster || '') + '">' + (isSub ? '✓ 已订阅' : '+ 订阅') + '</button>'
-      : '';
-    return '<div class="poster-card">'
-      + '<div class="poster-wrap">' + posterHtml
-      + '<span class="badge-type">' + typeLabel + '</span>'
-      + (c.rating ? '<span class="badge-rate">' + icon('star') + c.rating + '</span>' : '')
-      + '<span class="badge-status ' + cls + '"' + statusTip + '>' + status + '</span>'
-      + '</div>'
-      + '<div class="info">'
-      + '<div class="t" title="' + esc(c.title) + '">' + esc(c.title) + '</div>'
-      + '<div class="meta"><span>' + (c.year || '—') + ' · TMDB</span>' + subBtn + '</div>'
-      + '</div>'
-      + '</div>';
-  }).join('');
-  grid.insertAdjacentHTML('beforeend', html);
-  hydratePosters(grid);
+/* ── S2 第二段：/api/explore/status 批量现查，逐卡就地更新（§5.2）── */
+function _exploreCardsByType(cards){
+  var tv = [], movie = [];
+  (cards || []).forEach(function(c){
+    if (!c || !c.tmdb_id) return;
+    (c.type === 'tv' ? tv : movie).push(c.tmdb_id);
+  });
+  return { tv: tv, movie: movie };
 }
+async function _fetchExploreStatus(ids, media, seq){
+  if (!ids.length) return;
+  try {
+    var r = await api('/api/explore/status?ids=' + encodeURIComponent(ids.join(',')) + '&media=' + media);
+    if (seq !== exploreStatusSeq) return;       // 翻页/切筛选后旧响应作废
+    if (r.status !== 'success') return;
+    (r.data || []).forEach(function(row){
+      var tid = String(row.tmdb_id || row.fact && row.fact.tmdb_id || '');
+      var c = exploreCards[tid];
+      if (!c) return;
+      if (row.status === 'error') {
+        c._statusRow = { error: row.message || 'Emby 查询失败' };
+      } else {
+        c._statusRow = row;
+      }
+      updateExploreCardBadge(tid);
+    });
+  } catch(e){ /* 网络失败保持占位徽标，不打断浏览 */ }
+}
+function refreshExploreStatus(cards){
+  var seq = ++exploreStatusSeq;
+  var byType = _exploreCardsByType(cards || Object.keys(exploreCards).map(function(k){ return exploreCards[k]; }));
+  _fetchExploreStatus(byType.tv, 'tv', seq);
+  _fetchExploreStatus(byType.movie, 'movie', seq);
+}
+function updateExploreCardBadge(tid){
+  var grid = $('exploreGrid');
+  if (!grid) return;
+  var el = grid.querySelector('[data-explore-tmdb="' + String(tid).replace(/"/g, '\\"') + '"]');
+  if (!el) return;
+  var c = exploreCards[String(tid)];
+  if (!c) return;
+  var st = exploreStatus(c);
+  var badge = el.querySelector('.badge-status');
+  if (badge) {
+    badge.className = 'badge-status ' + st.cls;
+    badge.textContent = st.status;
+    if (st.tip) badge.setAttribute('title', st.tip);
+    else badge.removeAttribute('title');
+  }
+  var info = el.querySelector('.eps-info');
+  if (info) {
+    info.textContent = st.epsText || '';
+    info.style.display = st.epsText ? '' : 'none';
+  }
+}
+
+/* 60 秒自动刷新（D2 开，§5.2 额外项）：仅页面可见且探索页激活时对当前卡重跑第二段；切走即停 */
+function exploreAutoRefreshTick(){
+  if (document.hidden || document.visibilityState !== 'visible') return;
+  if (window.__activeTab !== 'explore') return;
+  if (exploreLoading) return;
+  refreshExploreStatus();
+}
+function ensureExploreAutoRefresh(){
+  if (exploreRefreshTimer) return;
+  exploreRefreshTimer = setInterval(exploreAutoRefreshTick, 60000);
+}
+function stopExploreAutoRefresh(){
+  if (exploreRefreshTimer) { clearInterval(exploreRefreshTimer); exploreRefreshTimer = null; }
+}
+/* 页面从隐藏切回可见时：若正在探索页，立即重跑一次第二段（不等 60 秒），随后由 interval 接管 */
+document.addEventListener('visibilitychange', function(){
+  if (!document.hidden) exploreAutoRefreshTick();
+});
 
 function setupInfiniteScroll(){
   if (window.__infiniteScrollReady) return;
@@ -3261,66 +3310,97 @@ function _subscribedTmdbIds(){
   return set;
 }
 function exploreStatus(c){
-  // 剧集：带集数进度
-  if (c.type === 'tv' && c.eps) {
-    // 实时查询失败时退回统一快照，加 * 标明集数可能滞后（避免让用户以为已经是最新）
-    var stale = c.eps_source === 'cache' ? '*' : '';
-    var staleTip = c.eps_source === 'cache' ? ' title="Emby 实时查询未成功，此处为缓存集数，可能滞后"' : '';
-    if (!c.eps.have || c.eps.have <= 0) return { status: '未入库', cls: 'no' };
-    if (c.eps.total > 0) {
-      if (c.eps.have >= c.eps.total) {
-        // 超集显示数字（如 已完整 45/40），刚好集齐只显示「已完整」
-        if (c.eps.have > c.eps.total) return { status: '已完整 ' + c.eps.have + '/' + c.eps.total + stale, cls: 'ok', tip: staleTip };
-        return { status: '已完整' + stale, cls: 'ok', tip: staleTip };
-      }
-      return { status: '连载中 · 已入库' + c.eps.have + '/' + c.eps.total + '集' + stale, cls: 'partial', tip: staleTip };
+  /* S2 卡片状态（§5.2 三态 + 错误显式分离）：
+     1) _statusRow.error → 「Emby 查询失败」（err 徽标，与未入库视觉分离，§5.1 不冒充）
+     2) 未查到 Emby 事实（占位）→ 「…」弱化徽标，等第二段回填
+     3) 未入库 → 「未入库」+ 可跳转订阅/找资源
+     4) 已入库剧集 → 已入库 N/总（total 用 TMDB 标称总数）+ 在更/缺集；电影 → 本地/分享 */
+  var row = c._statusRow;
+  if (row && row.error) return { status: '⚠ Emby 查询失败', cls: 'err', tip: 'Emby 查询失败：' + row.error };
+  var fact = row && row.fact;
+  if (!row) return { status: '…', cls: 'dim' };   // 第二段尚未返回的占位
+  if (c.type === 'tv') {
+    var cls0 = row.classification || {};
+    if (!fact || !fact.matched) return { status: '未入库', cls: 'no' };
+    var have = fact.have_total || 0;
+    var localN = (fact.local || []).length, shareN = (fact.share || []).length;
+    var inL = fact.in_local, inS = fact.in_share;
+    var total = fact.declared_total || fact.tmdb_total || 0;
+    var dataTime = row.data_time ? ' title="数据时间 ' + row.data_time + '"' : '';
+    var epsText = total > 0 ? ('已入库 ' + have + '/' + total + ' 集') : (inL || inS ? '已入库 ' + have + ' 集' : '');
+    if (cls0.status === 'missing' || cls0.status === 'ongoing_lagging') {
+      var missTxt = cls0.missing_ranges ? ('缺 ' + cls0.missing_ranges) : ('缺 ' + (cls0.aired_total || 0) + ' 集中的 ' + Math.max(0, (cls0.aired_total || 0) - have) + ' 集');
+      if (cls0.status === 'ongoing_lagging') return { status: '在更·落后 ' + have + '/' + (cls0.aired_total || total), cls: 'partial', tip: dataTime, epsText: epsText };
+      return { status: missTxt, cls: 'local', tip: dataTime, epsText: epsText };
     }
-    // TMDB 无总集数：退化为分库显示
-    if (c.in_local && c.in_share) return { status: '本地 ' + (c.eps.local || 0) + ' / 分享 ' + (c.eps.share || 0) + stale, cls: 'local', tip: staleTip };
-    if (c.in_local) return { status: '本地 ' + (c.eps.local || 0) + ' 集' + stale, cls: 'local', tip: staleTip };
-    if (c.in_share) return { status: '分享 ' + (c.eps.share || 0) + ' 集' + stale, cls: 'share', tip: staleTip };
+    if (cls0.status === 'extra') return { status: '超 ' + (cls0.extra || []).length + ' 集', cls: 'share', tip: dataTime, epsText: epsText };
+    if (cls0.status === 'ongoing') return { status: '⏳ 在更 · ' + (epsText || '已入库 ' + have + ' 集'), cls: 'partial', tip: dataTime, epsText: epsText };
+    if (cls0.status === 'complete') {
+      var md = cls0.manual_done ? '（已完结）' : '';
+      return { status: (total > 0 && have > total ? '已完整 ' + have + '/' + total : '已完整') + md, cls: 'ok', tip: dataTime, epsText: epsText };
+    }
+    // 分库兜底（分类未给出时）
+    if (inL && inS) return { status: '本地 ' + localN + ' / 分享 ' + shareN, cls: 'local', tip: dataTime, epsText: epsText };
+    if (inL) return { status: '本地 ' + localN + ' 集', cls: 'local', tip: dataTime, epsText: epsText };
+    if (inS) return { status: '分享 ' + shareN + ' 集', cls: 'share', tip: dataTime, epsText: epsText };
     return { status: '未入库', cls: 'no' };
   }
-  // 电影：单体文件，二元状态（参考图口径）
-  if (c.in_local || c.in_share) return { status: '已完整', cls: 'ok' };
+  // 电影：{in_local, in_share}
+  if (fact && fact.in_local && fact.in_share) return { status: '本地 + 分享', cls: 'local' };
+  if (fact && fact.in_local) return { status: '已入库 · 本地', cls: 'ok' };
+  if (fact && fact.in_share) return { status: '已入库 · 分享', cls: 'share' };
   return { status: '未入库', cls: 'no' };
 }
 
-function renderExploreCards(cards){
+function _exploreCardHtml(c, subSet){
+  var st = exploreStatus(c);
+  var status = st.status, cls = st.cls, statusTip = st.tip || '';
+  var typeLabel = c.type === 'tv' ? '剧集' : '电影';
+  /* poster 有两种来源：
+     1) TMDB 图片 → 直接 <img src>
+     2) /api/emby/poster/... → 需要 Basic Auth，走 data-emby-src，由 hydratePosters() 拉 blob */
+  var posterHtml;
+  if (!c.poster) {
+    posterHtml = '<div class="no-img">暂无海报</div>';
+  } else if (c.poster.indexOf('/api/emby/poster/') === 0) {
+    posterHtml = '<img data-emby-src="' + esc(c.poster) + '" alt="" loading="lazy">';
+  } else {
+    posterHtml = '<img src="' + esc(c.poster) + '" alt="" loading="lazy" onerror="this.style.display=\'none\';this.parentNode.innerHTML=\'<div class=&quot;no-img&quot;>暂无海报</div>\'">';
+  }
+  var isSub = subSet[String(c.tmdb_id)];
+  var subBtn = c.type === 'tv'
+    ? '<button class="sub-btn ' + (isSub ? 'on' : '') + '" data-tmdb="' + esc(c.tmdb_id) + '" data-title="' + esc(c.title) + '" data-poster="' + esc(c.poster || '') + '">' + (isSub ? '✓ 已订阅' : '+ 订阅') + '</button>'
+    : '';
+  return '<div class="poster-card" data-explore-tmdb="' + esc(c.tmdb_id) + '">'
+    + '<div class="poster-wrap">' + posterHtml
+    + '<span class="badge-type">' + typeLabel + '</span>'
+    + (c.rating ? '<span class="badge-rate">' + icon('star') + c.rating + '</span>' : '')
+    + '<span class="badge-status ' + cls + '"' + statusTip + '>' + esc(status) + '</span>'
+    + '</div>'
+    + '<div class="info">'
+    + '<div class="t" title="' + esc(c.title) + '">' + esc(c.title) + '</div>'
+    + '<div class="meta"><span>' + (c.year || '—') + ' · TMDB</span>'
+    + '<span class="eps-info" style="font-size:11px;color:#9ca3af;display:none"></span>'
+    + subBtn + '</div>'
+    + '</div>'
+    + '</div>';
+}
+
+function appendExploreCards(cards){
   var grid = $('exploreGrid');
-  if (!cards.length) { grid.innerHTML = '<div class="list-empty">无结果</div>'; return; }
   var subSet = _subscribedTmdbIds();
-  grid.innerHTML = cards.map(function(c){
-    var st = exploreStatus(c);
-    var status = st.status, cls = st.cls, statusTip = st.tip || '';
-    var typeLabel = c.type === 'tv' ? '剧集' : '电影';
-    /* poster 有两种来源：
-       1) TMDB 图片 → 直接 <img src>
-       2) /api/emby/poster/... → 需要 Basic Auth，走 data-emby-src，由 hydratePosters() 拉 blob */
-    var posterHtml;
-    if (!c.poster) {
-      posterHtml = '<div class="no-img">暂无海报</div>';
-    } else if (c.poster.indexOf('/api/emby/poster/') === 0) {
-      posterHtml = '<img data-emby-src="' + esc(c.poster) + '" alt="" loading="lazy">';
-    } else {
-      posterHtml = '<img src="' + esc(c.poster) + '" alt="" loading="lazy" onerror="this.style.display=\'none\';this.parentNode.innerHTML=\'<div class=&quot;no-img&quot;>暂无海报</div>\'">';
-    }
-    var isSub = subSet[String(c.tmdb_id)];
-    var subBtn = c.type === 'tv'
-      ? '<button class="sub-btn ' + (isSub ? 'on' : '') + '" data-tmdb="' + esc(c.tmdb_id) + '" data-title="' + esc(c.title) + '" data-poster="' + esc(c.poster || '') + '">' + (isSub ? '✓ 已订阅' : '+ 订阅') + '</button>'
-      : '';
-    return '<div class="poster-card">'
-      + '<div class="poster-wrap">' + posterHtml
-      + '<span class="badge-type">' + typeLabel + '</span>'
-      + (c.rating ? '<span class="badge-rate">' + icon('star') + c.rating + '</span>' : '')
-      + '<span class="badge-status ' + cls + '"' + statusTip + '>' + status + '</span>'
-      + '</div>'
-      + '<div class="info">'
-      + '<div class="t" title="' + esc(c.title) + '">' + esc(c.title) + '</div>'
-      + '<div class="meta"><span>' + (c.year || '—') + ' · TMDB</span>' + subBtn + '</div>'
-      + '</div>'
-      + '</div>';
-  }).join('');
+  (cards || []).forEach(function(c){ exploreCards[String(c.tmdb_id)] = c; });
+  var html = cards.map(function(c){ return _exploreCardHtml(c, subSet); }).join('');
+  grid.insertAdjacentHTML('beforeend', html);
+  hydratePosters(grid);
+}
+
+/* 首屏渲染：清空并填入第一页卡片（第二段由 loadExplore 随即触发） */
+function renderExploreGrid(cards){
+  var grid = $('exploreGrid');
+  if (!cards || !cards.length) { grid.innerHTML = '<div class="list-empty">无结果</div>'; return; }
+  var subSet = _subscribedTmdbIds();
+  grid.innerHTML = cards.map(function(c){ return _exploreCardHtml(c, subSet); }).join('');
   hydratePosters(grid);
 }
 async function toggleSubscribe(tmdbId, title, poster){
