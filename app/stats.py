@@ -91,9 +91,6 @@ def _recompute_all_stats():
     now = time.time()
     state._lib_stats_cache['ts'] = now
     state._lib_stats_cache['data'] = result
-    # 同一次遍历的总数同步写入 STRM 计数缓存（内存+磁盘），两处数字永远一致
-    state._strm_count_cache.update({'ts': now, 'local': out['local_total'], 'share': out['share_total']})
-    _save_strm_count_disk(out['local_total'], out['share_total'])
     return result
 
 def action_library_stats(args):
@@ -103,57 +100,20 @@ def action_library_stats(args):
         return state._lib_stats_cache['data']
     return _recompute_all_stats()
 
-def _load_strm_count_disk():
-    """STRM 计数持久缓存（SQLite 文档 strm_count）：(local, share, ts) 或 None"""
-    data = storage.db_doc_get(storage.DOC_STRM_COUNT)
-    try:
-        return int(data.get('local', 0)), int(data.get('share', 0)), float(data.get('ts', 0))
-    except (AttributeError, TypeError, ValueError):
-        return None
-
-def _save_strm_count_disk(local, share):
-    if not storage.db_doc_put(storage.DOC_STRM_COUNT, {'ts': time.time(), 'local': local, 'share': share}):
-        log.warning('STRM 计数缓存写入失败')
-
-def _strm_count_bg_refresh():
-    """后台重算统计（单飞）。走 _recompute_all_stats 统一遍历，
-    同时更新分类统计与 STRM 计数，保证两处数字一致。"""
-    if not state._strm_count_refreshing.acquire(blocking=False):
-        return
-    try:
-        _recompute_all_stats()
-        log.info('后台刷新统计完成: local=%d share=%d',
-                 state._strm_count_cache['local'], state._strm_count_cache['share'])
-    except Exception as e:
-        log.warning('统计后台刷新失败: %s', e)
-    finally:
-        state._strm_count_refreshing.release()
-
 def _get_strm_counts():
-    """STRM 总数三级缓存：内存(5分钟) → 磁盘(立即返回+后台刷新) → 同步首算。
-    大库 rglob 全量遍历很慢，磁盘缓存保证总览页秒开，后台静默刷新。"""
+    """STRM 总数（S7 收敛）：单一来源 = 分类统计的 5 分钟内存缓存（同一次遍历产出）。
+    旧的「strm_count 内存+磁盘第二套缓存」已删——两套缓存各自计时是总览数字
+    与分类统计对不上的根源；现在只有一个缓存层，数字天然一致。
+    缓存过期且后台无人在算时同步重算（rglob 大库慢，但每 5 分钟最多一次）。"""
     now = time.time()
-    if now - state._strm_count_cache['ts'] < state._CACHE_TTL and state._strm_count_cache['ts'] > 0:
-        return state._strm_count_cache['local'], state._strm_count_cache['share']
-    disk = _load_strm_count_disk()
-    if disk is not None:
-        l, s_, ts = disk
-        state._strm_count_cache.update({'ts': ts or (now - state._CACHE_TTL), 'local': l, 'share': s_})
-        if time.time() - state._strm_count_cache['ts'] >= state._CACHE_TTL:
-            threading.Thread(target=_strm_count_bg_refresh, daemon=True,
-                             name='strm-count-refresh').start()
-        return state._strm_count_cache['local'], state._strm_count_cache['share']
-    # 首次无任何缓存：同步算一次并落盘
-    l = sum(1 for _ in state.L_ROOT.rglob('*.strm')) if state.L_ROOT.exists() else 0
-    s_ = sum(1 for _ in state.S_ROOT.rglob('*.strm')) if state.S_ROOT.exists() else 0
-    state._strm_count_cache.update({'ts': now, 'local': l, 'share': s_})
-    _save_strm_count_disk(l, s_)
-    log.info('缓存刷新 STRM 计数: local=%d share=%d', l, s_)
-    return l, s_
+    data = state._lib_stats_cache['data']
+    if data is not None and (now - state._lib_stats_cache['ts']) < state._CACHE_TTL:
+        return int(data.get('local_total', 0)), int(data.get('share_total', 0))
+    result = _recompute_all_stats()
+    return int(result['local_total']), int(result['share_total'])
 
 def _clear_stats_caches():
     """只清统计内存缓存（供失效总线回调调用；不再触发 bump，避免递归）。"""
-    state._strm_count_cache['ts'] = 0
     state._lib_stats_cache['ts'] = 0
     state._lib_stats_cache['data'] = None
 

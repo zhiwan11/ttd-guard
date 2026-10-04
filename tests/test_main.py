@@ -82,10 +82,12 @@ class TestStartupRequiresPassword:
             env=env, capture_output=True, text=True, timeout=90,
         )
 
-    def test_refuses_without_password_and_without_allow_no_auth(self):
+    def test_starts_without_password_when_no_auth_disabled(self):
+        # S7（§5.9 / D5 默认关）：空密码不再拒绝启动——只日志提示一次，
+        # 是否免登录由设置页「免登录（仅局域网）」开关（web_no_auth，默认 0）决定。
         r = self._run({'WEB_PASSWORD': '', 'ALLOW_NO_AUTH': ''})
-        assert r.returncode != 0, f'应该拒绝启动，实际 returncode={r.returncode}'
-        assert 'IMPORTED_OK' not in r.stdout
+        assert r.returncode == 0, f'应该正常导入，实际 stderr={r.stderr[-2000:]}'
+        assert 'IMPORTED_OK' in r.stdout
 
     def test_starts_without_password_when_allow_no_auth_set(self):
         r = self._run({'WEB_PASSWORD': '', 'ALLOW_NO_AUTH': '1'})

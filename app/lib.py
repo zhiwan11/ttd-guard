@@ -143,26 +143,17 @@ def _match_governance_key(S, L, skey, container, strategy, kind):
             # 0 个候选 -> 回退剧名 + 年份
     return L.find((skey, S.meta[skey]), container)
 
-_lib_cache = {}
-_lib_cache_lock = threading.Lock()
-LIB_CACHE_TTL = 30
+# S7 收敛（白皮书 :326）：Lib 30 秒短时效缓存已删。
+# 每次 _get_lib 都现扫磁盘——正确性优先（执行清理前的二次校验、补齐缺集后的对照
+# 都必须基于最新磁盘状态，不能吃上一次扫描的快照）；失效总线/扫描完成后的
+# _invalidate_lib_cache 保留为兼容壳（不再有任何缓存可清，测试与调用方无需改动）。
 
 
 def _get_lib(root: Path) -> Lib:
-    key = str(root)
-    now = time.time()
-    with _lib_cache_lock:
-        hit = _lib_cache.get(key)
-        if hit and now - hit[0] < LIB_CACHE_TTL:
-            return hit[1]
-    lib = Lib(root)
-    with _lib_cache_lock:
-        _lib_cache[key] = (now, lib)
-    return lib
+    return Lib(root)
 
 def _invalidate_lib_cache():
-    with _lib_cache_lock:
-        _lib_cache.clear()
+    return None
 
 def _normalize_title(name: str) -> str:
     """规范化目录/文件名：去 tmdb 后缀、全角转半角、所有分隔符统一成单空格"""

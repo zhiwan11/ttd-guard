@@ -1030,8 +1030,13 @@ def action_inter_check(args):
     # 计数直接取自 build_plan 刚遍历出来的 lib.Lib（同一次遍历，数据与计划严格一致），
     # 不再为了计数把双库重新 rglob 一遍——大库/网络挂载上这是扫描耗时翻倍的元凶。
     try:
-        state._strm_count_cache.update({'ts': time.time(), 'local': L_lib.strm_count, 'share': S_lib.strm_count})
-        stats._save_strm_count_disk(L_lib.strm_count, S_lib.strm_count)
+        # S7：strm_count 独立缓存层已删——计数并入统计缓存（同一次遍历，单一来源）
+        state._lib_stats_cache['ts'] = time.time()
+        state._lib_stats_cache['data'] = {
+            'status': 'success', 'rows': [],
+            'local_total': L_lib.strm_count, 'share_total': S_lib.strm_count,
+            'local_other': 0, 'share_other': 0,
+        }
         log.info('扫描后刷新 STRM 计数: local=%d share=%d', L_lib.strm_count, S_lib.strm_count)
     except Exception as e:
         log.warning('刷新 STRM 计数缓存失败: %s', e)
@@ -1220,7 +1225,6 @@ def _run_inter_clean(args):
         # 文件已变动，主动失效 lib.Lib 缓存，避免下次 build_plan 用到陈旧数据
         lib._invalidate_lib_cache()
         # 同时失效统计缓存（总览页下次重算）
-        state._strm_count_cache['ts'] = 0
         state._lib_stats_cache['ts'] = 0
         state._lib_stats_cache['data'] = None
     if skipped:

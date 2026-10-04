@@ -2,6 +2,14 @@
 
 ## 1.8.8
 
+### S7 清理残留收口：缓存收敛、遗留参数、免登录开关与验收闸门
+
+- **缓存层收敛（11+3 → TMDB 24h + 事实层 + 映射持久层）**：删除探索索引 `_emby_index_cache`（S2 起无读方）、实时分集微缓存 `_live_eps_cache`（探索第二段与追更本就现查）、统一快照 `library_snapshot` 第二套存储（`unified_health` 直读唯一持久层 Emby→TMDB 对照缓存）、`emby_overview` 第二套磁盘文档（全量拉取只落一个持久层）、STRM 计数独立双层缓存（并入统计缓存，同一次遍历产出、数字天然一致）、Lib 30 秒短时效缓存（每次 `_get_lib` 现扫磁盘，正确性优先；失效函数保留为兼容壳）。保留：TMDB 24h 缓存、事实层 media_facts、入库轮询缓存（晨报已到点现查）、订阅状态库。
+- **浏览器端缓存清理**：删除 localStorage `dashboardCache`/`libStatsCache`/`dashEmbyCache` 与 sessionStorage `govState`（治理扫描结果以「最近扫描」接口为唯一来源）；浏览器端只保留主题偏好与页签记忆。
+- **遗留参数删除**：`get_tmdb_scan_progress` 一套删除，进度并入 `/api/emby/library?progress=1`（前端进度条轮询同端点）；`emby_index` 等已废弃文档仅保留一次性旧文件迁移。
+- **免登录开关（§5.9 / D5 默认关）**：`WEB_PASSWORD` 为空不再拒绝启动，只日志提示一次；设置页新增「免登录（仅局域网）」开关（config `web_no_auth`，默认关，含一次性公网风险说明），替代仅靠 `ALLOW_NO_AUTH` 环境变量的隐式路径；Cookie 会话与 CSRF 同源校验保留。
+- **验收闸门**：A10 实测 `app/` 内 `except ImportError`=0、`_eng(`=0、engine.py 无重导出（仅 ACTIONS+转发壳）；A11 红线回归 test_engine/test_safety 全绿。
+
 ### 架构净化与多端同步重构
 
 - **engine.py 拆分与清理**：所有路径常量、运行时配置、跨模块缓存与锁收归底层叶子模块 `app/state.py`；各业务模块直接引用所属模块，彻底清除 380+ 处 `_eng()` 动态反射间接调用；`engine.py` 净化为纯轻量兼容壳与 CLI 入口。

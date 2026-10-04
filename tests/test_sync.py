@@ -35,11 +35,9 @@ def _clean_sync(monkeypatch):
 
 
 def _seed_caches():
+    # S7 收敛后：emby_index / live_eps / strm_count 层已删，只剩 emby_lib_cache + lib_stats
     state._ep_cache.update({'ts': 1, 'data': {'x': 1}})
-    state._emby_index_cache.update({'ts': 1, 'data': {'x': 1}})
     state._emby_lib_cache.update({'ts': 1, 'data': {'x': 1}})
-    state._live_eps_cache['k'] = (1, {})
-    state._strm_count_cache.update({'ts': 1, 'local': 5, 'share': 6})
     state._lib_stats_cache.update({'ts': 1, 'data': {'rows': []}})
 
 
@@ -91,12 +89,9 @@ class TestInvalidateMedia:
         stats.invalidate_media_caches()
         assert sync.versions()['library'] >= 1
         assert state._ep_cache['data'] is None
-        assert state._emby_index_cache['data'] is None
         assert state._emby_lib_cache['data'] is None
-        assert state._live_eps_cache == {}
-        assert state._strm_count_cache['ts'] == 0
         assert state._lib_stats_cache['data'] is None
-        assert 'emby_index' in state._stale and 'emby_overview' in state._stale
+        assert 'emby_overview' in state._stale
 
     def test_keep_emby_lib_preserves_overview(self, isolated_state):
         _seed_caches()
@@ -110,8 +105,7 @@ class TestInvalidateMedia:
     def test_invalidate_stats_cache_bumps(self, isolated_state):
         _seed_caches()
         stats.invalidate_stats_cache()
-        assert state._strm_count_cache['ts'] == 0
-        assert state._lib_stats_cache['data'] is None
+        assert state._lib_stats_cache['ts'] == 0 and state._lib_stats_cache['data'] is None
         assert sync.versions()['library'] >= 1
 
 

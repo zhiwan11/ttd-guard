@@ -134,10 +134,13 @@ class TestUnifiedLibrarySnapshot:
 
 
 def test_daily_consistency_snapshot_exposes_shared_rule_signature(monkeypatch, isolated_state):
-    monkeypatch.setattr(morning, 'load_library_snapshot', lambda max_age=None, background_refresh=True: {
-        'ts': 100.0, 'stats': {'series': 2, 'movies': 1}, 'episode_total': 12,
-        'top_missing': [{'name': 'A', 'missing': 3}], 'series': [], 'movies': []
-    })
+    # S7：library_snapshot 第二套快照已删，unified_health 直读唯一持久层
+    monkeypatch.setattr(morning, 'read_emby_lib_cache', lambda max_age=None: {
+        'ts': 100.0, 'stats': {'series': 2, 'movies': 1},
+        # unified_health 由缓存行 have_eps 汇总 episode_total（7 = 单行 have_eps）
+        'top_missing': [{'name': 'A', 'missing': 3}],
+        'series': [{'name': 'A', 'have_eps': 7}],
+        'movies': []})
     monkeypatch.setattr(config, 'load_config', lambda: {
         'strategy_decision': 'quality_first', 'strategy_multi_season_protect': 'compare',
         'strategy_tie_keep_local': '0', 'strategy_exempt_keywords': '收藏',
@@ -147,7 +150,7 @@ def test_daily_consistency_snapshot_exposes_shared_rule_signature(monkeypatch, i
     monkeypatch.setattr(config, 'get_strategy', lambda: {'decision': 'quality_first'})
     snap = engine.daily_consistency_snapshot(False)
     assert len(snap['rule_sig']) == 16
-    assert snap['library']['episode_total'] == 12
+    assert snap['library']['episode_total'] == 7
     assert snap['ingest']['stats'] == {}
 
 
@@ -183,7 +186,6 @@ def test_ingest_refill_auto_refreshes_mapping_cache_without_full_tmdb_scan(monke
                             tmdb_info={'match_status': 'aligned', 'tmdb_total': 10, 'diff': 0},
                             complete=True))
     monkeypatch.setattr(morning, '_patch_all_caches', lambda patch: None)
-    monkeypatch.setattr(morning, 'save_library_snapshot', lambda snap: None)
 
     out = engine.refresh_mapping_cache_after_ingest({
         'ok': True,

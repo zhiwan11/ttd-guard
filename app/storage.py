@@ -39,6 +39,8 @@ DOC_BOT_DELETE_QUEUE = 'bot_delete_queue'
 DOC_INGEST = 'ingest_cache'
 DOC_EMBY_LIB = 'emby_library_with_tmdb'
 DOC_EMBY_OVERVIEW = 'emby_overview'
+# ↓ S7 缓存收敛后已无写入方：常量与旧 JSON 文件名仅保留给 db_migrate 的一次性导入
+#   （迁移完成后业务代码不再读写这些文档；物理文件改名 *.migrated 备灾）
 DOC_LIB_SNAPSHOT = 'library_snapshot'
 DOC_EMBY_INDEX = 'emby_index'
 DOC_STRM_COUNT = 'strm_count'

@@ -119,19 +119,17 @@ def check_external() -> None:
 def _clear_library_caches():
     """清空所有与「媒体库文件」相关的内存缓存，并为磁盘(库)缓存打 stale 标记。
 
-    磁盘缓存（emby 索引 / 片库映射总览）光清内存不够：读者会把旧库副本再塞回内存。
-    state._stale 记录需要「立即后台重建」的磁盘缓存名，由读取方
-    （tmdb.emby_library_index / morning.emby_library_overview）检查后触发刷新。
+    片库映射总览（emby_lib_cache）是 SQLite(库) 持久缓存，光清内存不够：读者会把
+    旧库副本再塞回内存。state._stale 记录需要「立即后台重建」的磁盘缓存名，由读取方
+    （morning.emby_library_overview）检查后触发刷新。
+    S7 缓存收敛：emby_index / live_eps / strm_count / lib_stats 各层已删除，
+    探索/统计的实时性由 facts / 现查路径承担。
     """
     from . import stats, lib        # 函数级导入：避免 sync ↔ stats 模块级 import 环
     state._ep_cache['ts'] = 0
     state._ep_cache['data'] = None
-    state._emby_index_cache['ts'] = 0
-    state._emby_index_cache['data'] = None
     state._emby_lib_cache['ts'] = 0
     state._emby_lib_cache['data'] = None
-    state._live_eps_cache.clear()
-    state._stale.add('emby_index')
     state._stale.add('emby_overview')
     lib._invalidate_lib_cache()
     stats._clear_stats_caches()

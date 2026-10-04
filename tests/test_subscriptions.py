@@ -557,7 +557,9 @@ class TestExploreLiveEps:
         finally:
             emby.emby_request = old
 
-    def test_micro_cache_absorbs_rapid_refresh(self):
+    def test_live_query_always_fresh_after_cache_removal(self):
+        # S7 缓存收敛：live_eps 微缓存已删除——同一剧两次查询都现查 Emby，
+        # 新鲜度由「单次 Series+Episode 请求很快」与调用方现查语义承担。
         calls = {'n': 0}
 
         def fake(path, params=None, method='GET', timeout=15):
@@ -577,11 +579,9 @@ class TestExploreLiveEps:
             engine._emby_series_live_eps('CACHE_HIT_TMDB', 'CACHE_HIT_SR')
             first = calls['n']
             engine._emby_series_live_eps('CACHE_HIT_TMDB', 'CACHE_HIT_SR')
-            assert calls['n'] == first, '15 秒内应命中微缓存，不重复打 Emby'
+            assert calls['n'] == first + 1, '微缓存已删，两次查询都应现查'
         finally:
             emby.emby_request = old
-            with engine._live_eps_lock:
-                engine._live_eps_cache.pop('CACHE_HIT_TMDB', None)
 
     def test_emby_error_propagates(self):
         # S0 P1-C：Emby 请求失败抛 EmbyError（不返回 None 冒充「查不到」），

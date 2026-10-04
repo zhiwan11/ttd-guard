@@ -175,24 +175,10 @@ _ep_lock = threading.Lock()
 _QUIET_LAST = {'n': 0}
 
 
-_emby_index_cache = {'ts': 0, 'data': None}
-_emby_index_refresh_lock = threading.Lock()
-
-
-_emby_lib_cache = {'ts': 0, 'data': None}
+_emby_lib_cache = {'ts': 0, 'data': None}   # 片库映射唯一持久缓存（S7 收敛后保留层）
 
 
 _overview_refresh_lock = threading.Lock()
-
-
-# ═══════════════ 探索页实时集数（绕过统一快照）═══════════════
-# 背景：探索页此前依赖 library_snapshot.json（30 分钟强制缓存），快照本身又建立在
-# emby_library_overview 的产物之上，而那个磁盘缓存只在「片库映射」全量对照时才写。
-# 三者新鲜度互不相同，导致刚入库的集在探索页迟迟不更新，且刷新页面永远不自愈。
-# 这里的实时查询只问「这一部剧现在有哪些集」，1 次 Series + 1~2 次 Episode，
-# 单剧毫秒级；配合并发 + 短 TTL 微缓存，既跟得上入库又能扛住连点刷新。
-_live_eps_cache = {}
-_live_eps_lock = threading.Lock()
 
 
 _tmdb_scan_progress = {
@@ -204,18 +190,14 @@ _tmdb_scan_progress = {
 _tmdb_scan_lock = threading.Lock()
 
 
-# ============ 性能缓存（5 分钟 TTL）============
-_strm_count_cache = {'ts': 0, 'local': 0, 'share': 0}
+# ============ 统计缓存（5 分钟 TTL；S7 收敛后唯一一层：strm_count 双层已删） ============
 _lib_stats_cache = {'ts': 0, 'data': None}
 _CACHE_TTL = 300
 
 # 需要「立即后台重建」的磁盘(库)缓存名集合（sync.py 的 library 失效回调写入）。
-# 关键：emby 索引 / 片库映射总览 是 SQLite(库) 持久缓存，只清内存的话读者会把旧库副本
-# 再塞回内存、永远不更新。读取方必须检查：
-#   - tmdb.emby_library_index()        读 state._emby_index_cache 前先看 'emby_index' in state._stale
-#   - morning.emby_library_overview()  读 state._emby_lib_cache 前先看 'emby_overview' in state._stale
-# 命中则立即后台刷新（并 discard 标记），不走「磁盘旧值 + 到期才刷新」的懒惰路径。
+# 片库映射总览（emby_lib_cache）是 SQLite(库) 持久缓存，只清内存的话读者会把旧库副本
+# 再塞回内存、永远不更新。读取方（morning.emby_library_overview）必须检查
+# 'emby_overview' in state._stale：命中则立即后台刷新（并 discard 标记），
+# 不走「磁盘旧值 + 到期才刷新」的懒惰路径。
 _stale = set()
 
-
-_strm_count_refreshing = threading.Lock()

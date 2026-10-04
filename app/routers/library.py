@@ -98,6 +98,20 @@ def api_explore(region: str = 'all', year: str = '', sort: str = 'popularity',
         return {'status': 'error', 'message': str(e)}
 
 
+def _tmdb_scan_progress_dict():
+    """后台 TMDB 对照的进度快照（并入 api_emby_library，原 get_tmdb_scan_progress 收口）。"""
+    p = dict(morning.state._tmdb_scan_progress)
+    if p.get('running') and p.get('started_at'):
+        p['elapsed_sec'] = int(time.time() - p['started_at'])
+        p['eta_sec'] = int(p['elapsed_sec'] / p['done'] * (p['total'] - p['done'])) if p.get('done') else None
+        p['percent'] = int(p['done'] / p['total'] * 100) if p.get('total') else 0
+    else:
+        p['elapsed_sec'] = (p.get('finished_at') - p.get('started_at')) if p.get('finished_at') and p.get('started_at') else 0
+        p['eta_sec'] = None
+        p['percent'] = 100 if p.get('finished_at') else 0
+    return p
+
+
 EXPLORE_STATUS_MAX_IDS = 60     # 一屏最多 40 张卡，60 留余量；防恶意超长查询
 EXPLORE_STATUS_WORKERS = 8      # 与旧探索页实时集数并发度一致
 
@@ -142,19 +156,18 @@ def api_explore_status(ids: str = '', media: str = 'tv'):
             'data_time': time.strftime('%Y-%m-%d %H:%M', time.localtime())}
 
 
-@router.get('/api/tmdb/progress', dependencies=[Depends(auth)])
-def api_tmdb_progress():
-    return {'status': 'success', 'progress': morning.get_tmdb_scan_progress()}
-
-
 @router.get('/api/emby/library', dependencies=[Depends(auth)])
-def api_emby_library(force: int = 0, with_tmdb: int = 1):
+def api_emby_library(force: int = 0, with_tmdb: int = 1, progress: int = 0):
     """片库映射数据源（S3 起废除 cache_only=1 口径——页打开读 /api/mapping）。
 
+    - progress=1：只回后台对照进度快照（原 /api/tmdb/progress 收口于此）；
     - with_tmdb=0：快速模式，只拉 Emby 库，不查 TMDB；
     - 非 force：读 6 小时内的 TMDB 对照缓存；
     - force=1：启动后台对照任务，立即返回。
     """
+    # 只回进度：前端对照进度条轮询用（S7：独立 progress 端点已并入）
+    if progress:
+        return {'status': 'success', 'progress': _tmdb_scan_progress_dict()}
     # 快速模式：不查 TMDB
     if not with_tmdb:
         return morning.action_emby_library(Args(force=False, with_tmdb=False))
@@ -164,8 +177,10 @@ def api_emby_library(force: int = 0, with_tmdb: int = 1):
         if cached:
             cached['from_cache'] = True
             return cached
-    # force=1：启动后台任务，立即返回
-    prog = morning.get_tmdb_scan_progress()
+    # force=1：启动后台任务，立即返回。
+    # S7：get_tmdb_scan_progress 一套已并入这里——进度随本端点下发
+    #（前端轮询本端点即可拿到 started/running 状态与进度），不再有单独接口。
+    prog = _tmdb_scan_progress_dict()
     if prog.get('running'):
         return {'status': 'running', 'message': 'TMDB 对照已在后台运行', 'progress': prog}
     import threading as _th

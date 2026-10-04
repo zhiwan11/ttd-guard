@@ -138,14 +138,12 @@ def get_task(tid: str):
 
 @router.post('/api/cache/refresh', dependencies=[Depends(auth)])
 def api_cache_refresh():
-    """清除全部内存缓存并触发后台重建（STRM 计数 / 片库映射 / 统计 / 分集 / Emby 索引）。
+    """清除全部内存缓存并触发后台重建（片库映射 / 统计 / 分集；S7 收敛后 STRM 计数并入统计层）。
     磁盘缓存文件保留作为兜底，后台重建完成后自动覆盖。"""
     try:
         stats.invalidate_media_caches()
         threading.Thread(target=morning._overview_bg_refresh, daemon=True,
                          name='cache-refresh-overview').start()
-        threading.Thread(target=stats._strm_count_bg_refresh, daemon=True,
-                         name='cache-refresh-strm').start()
         return {'status': 'success', 'message': '缓存已清除，后台正在重建'}
     except Exception as e:
         return {'status': 'error', 'message': str(e)}

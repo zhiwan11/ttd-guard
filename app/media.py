@@ -86,14 +86,10 @@ def library_items(kind):
 
 
 def invalidate(tmdb_id=None):
-    """失效缓存：库清单总是清；tmdb_id 为空时清全部实时分集，否则只清指定那一部。"""
+    """失效缓存：库清单（60 秒 TTL）清空。S7 收敛后 live_eps 微缓存已删除，实时刻
+    由调用方（订阅/探索第二段）现查承担。tmdb_id 参数保留兼容旧调用方（忽略）。"""
     with _lib_lock:
         _lib_cache.clear()
-    with state._live_eps_lock:
-        if tmdb_id is None:
-            state._live_eps_cache.clear()
-        else:
-            state._live_eps_cache.pop(str(tmdb_id), None)
 
 
 def is_ghost(path):
@@ -212,18 +208,13 @@ def series_ids_by_tmdb(tmdb_id, fallback_id=None):
 
 
 def series_live(tmdb_id, fallback_id=None, use_cache=True):
-    """某剧实时分集；15 秒微缓存写 state._live_eps_cache。完全查不到返回 None。
+    """某剧实时分集（S7：live_eps 微缓存已删除，use_cache 参数保留兼容调用方）。
 
-    结果额外带 series_id / series_name，供订阅追更直接使用。
+    结果额外带 series_id / series_name，供订阅追更直接使用；完全查不到返回 None。
+    实时性由调用方控制：订阅/探索第二段本来就要求现查现报。
     """
     if not tmdb_id:
         return None
-    ck = str(tmdb_id)
-    if use_cache:
-        with state._live_eps_lock:
-            hit = state._live_eps_cache.get(ck)
-            if hit and time.time() - hit[0] < LIVE_TTL:
-                return hit[1]
     items = _series_items_by_tmdb(tmdb_id, fallback_id)
     ids = [it['Id'] for it in items if it.get('Id')]
     if not ids:
@@ -231,13 +222,6 @@ def series_live(tmdb_id, fallback_id=None, use_cache=True):
     out = live_episodes(ids)
     out['series_id'] = ids[0]
     out['series_name'] = next((it.get('Name') for it in items if it.get('Name')), '')
-    if use_cache:
-        with state._live_eps_lock:
-            state._live_eps_cache[ck] = (time.time(), out)
-            # 轻量清理：只保留最近 2000 条，避免长跑进程内存无界增长
-            if len(state._live_eps_cache) > 2000:
-                for k, _v in sorted(state._live_eps_cache.items(), key=lambda kv: kv[1][0])[:500]:
-                    state._live_eps_cache.pop(k, None)
     return out
 
 

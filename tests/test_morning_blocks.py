@@ -241,7 +241,6 @@ class TestGapBlock:
         monkeypatch.setattr(morning, 'read_emby_lib_cache', lambda max_age=None: {
             'ts': time.time(), 'series': series, 'movies': []})
         monkeypatch.setattr(morning, 'save_emby_lib_cache', lambda data, keep_ts=False: None)
-        monkeypatch.setattr(morning, 'save_library_snapshot', lambda snap: None)
         monkeypatch.setattr(morning, 'build_library_health_snapshot', lambda max_age=None: {})
         # 默认：只有 missing 进缺集榜
         monkeypatch.setattr(morning, 'gap_include_lagging', lambda: False)

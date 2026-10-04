@@ -78,32 +78,18 @@ def _sync_movie_fact(movie):
     })
 
 
-def _save_overview_disk(out):
-    """片库映射持久缓存（SQLite 文档 emby_overview，结构 {'ts', 'data'}）"""
-    if not storage.db_doc_put(storage.DOC_EMBY_OVERVIEW, {'ts': time.time(), 'data': out}):
-        log.warning('片库映射缓存写入失败')
-
-def _load_overview_disk():
-    """返回 {'ts': float, 'data': {...}} 或 None"""
-    raw = storage.db_doc_get(storage.DOC_EMBY_OVERVIEW)
-    if isinstance(raw, dict):
-        data = raw.get('data')
-        if isinstance(data, dict) and 'series' in data:
-            try:
-                return {'ts': float(raw.get('ts', 0)), 'data': data}
-            except (TypeError, ValueError):
-                pass
-    return None
-
 def _overview_bg_refresh():
-    """后台重建片库映射数据（单飞），完成后更新内存+磁盘缓存"""
+    """后台重建片库映射数据（单飞），完成后更新内存缓存并写唯一持久层 DOC_EMBY_LIB。
+
+    S7 收敛：emby_overview 第二套磁盘文档已删——全量 Emby 拉取只落一个持久层，
+    读方（read_emby_lib_cache / emby_library_overview）共用同一份。"""
     if not state._overview_refresh_lock.acquire(blocking=False):
         return
     try:
         out = _build_emby_library_overview()
         state._emby_lib_cache['ts'] = time.time()
         state._emby_lib_cache['data'] = out
-        _save_overview_disk(out)
+        save_emby_lib_cache(out, keep_ts=True)
         sync.bump('library', invalidate=False, reason='overview_refresh')
         log.info('片库映射缓存后台刷新完成：剧集 %d / 电影 %d',
                  len(out.get('series', [])), len(out.get('movies', [])))
@@ -113,25 +99,26 @@ def _overview_bg_refresh():
         state._overview_refresh_lock.release()
 
 def emby_library_overview(force=False):
-    """片库映射数据三级缓存：内存(5分钟) → 磁盘(立即返回+后台刷新) → 同步构建。
-    全量拉取 Emby 分集很慢，磁盘缓存保证每次进页面秒开，后台静默更新。"""
+    """片库映射数据：内存(5分钟) → 唯一持久层 DOC_EMBY_LIB(立即返回+后台刷新) → 同步构建。
+    全量拉取 Emby 分集很慢，持久缓存保证每次进页面秒开，后台静默更新。
+    S7 收敛：emby_overview 双层磁盘已删（11+3 → TMDB 24h+事实层+本层）。"""
     if not force:
         if state._emby_lib_cache['data'] and time.time() - state._emby_lib_cache['ts'] < state._CACHE_TTL:
             return state._emby_lib_cache['data']
-        disk = _load_overview_disk()
+        disk = read_emby_lib_cache(max_age=None)
         if disk is not None:
-            state._emby_lib_cache['data'] = disk['data']
-            state._emby_lib_cache['ts'] = disk['ts']
+            state._emby_lib_cache['data'] = disk
+            state._emby_lib_cache['ts'] = disk.get('ts') or time.time()
             stale = 'emby_overview' in state._stale
             state._stale.discard('emby_overview')
-            if stale or time.time() - disk['ts'] >= state._CACHE_TTL:
+            if stale or time.time() - state._emby_lib_cache['ts'] >= state._CACHE_TTL:
                 threading.Thread(target=_overview_bg_refresh, daemon=True,
                                  name='emby-overview-refresh').start()
             return state._emby_lib_cache['data']
     out = _build_emby_library_overview()
     state._emby_lib_cache['ts'] = time.time()
     state._emby_lib_cache['data'] = out
-    _save_overview_disk(out)
+    save_emby_lib_cache(out, keep_ts=True)
     return out
 
 def _build_emby_library_overview():
@@ -371,29 +358,6 @@ def build_library_health_snapshot(max_age=1800):
                 'source': 'emby_tmdb_cache'}
     return snapshot
 
-def save_library_snapshot(snapshot):
-    if not storage.db_doc_put(storage.DOC_LIB_SNAPSHOT, snapshot):
-        log.warning('统一片库快照写入失败')
-
-def load_library_snapshot(max_age=None, background_refresh=True):
-    data = storage.db_doc_get(storage.DOC_LIB_SNAPSHOT)
-    if not isinstance(data, dict):
-        return None
-    if max_age is not None and time.time() - float(data.get('ts') or 0) > max_age:
-        if background_refresh:
-            threading.Thread(target=refresh_library_snapshot_background, daemon=True, name='library-snapshot-refresh').start()
-        return data
-    return data
-
-def refresh_library_snapshot_background():
-    """从已存在的 TMDB 对照缓存生成轻量快照；不触发网络扫描。"""
-    try:
-        snap = build_library_health_snapshot()
-        if snap.get('series') or snap.get('movies'):
-            save_library_snapshot(snap)
-    except Exception as e:
-        log.warning('统一片库快照刷新失败: %s', e)
-
 def unified_health(max_age=1800):
     """统一健康数据入口。只读已有快照，不在晨报请求线程里触发全量 Emby 扫描。
 
@@ -401,11 +365,9 @@ def unified_health(max_age=1800):
     这里返回空快照，让晨报继续生成，而不是因为一次 Emby 异常导致预览/发送整体失败。
     """
     try:
-        snap = load_library_snapshot(max_age=max_age)
-        if snap:
-            return snap
-        # 兼容已有 Emby→TMDB 对照缓存：只从缓存重建轻量健康快照，绝不触发网络扫描。
-        cached = read_emby_lib_cache(max_age=None)
+        # S7：library_snapshot 第二套快照已删——统一读唯一持久层（Emby→TMDB 对照缓存），
+        # 不再维护「快照又建立在缓存产物上」的第二份数据。
+        cached = read_emby_lib_cache(max_age=max_age)
         if cached:
             series = _apply_manual_done_to_series(cached.get('series') or [])
             movies = cached.get('movies') or []
@@ -428,9 +390,10 @@ def unified_health(max_age=1800):
                                 'have': int(row.get('have_eps') or row.get('total_episodes') or 0),
                                 'missing_ranges': ti.get('missing_ranges') or ''})
             top.sort(key=lambda x: x['diff'], reverse=True)
+            eps = sum(int(x.get('have_eps') or x.get('total_episodes') or 0) for x in series)
             return {'schema_version': 1, 'ts': cached.get('ts') or 0,
                     'series': series, 'movies': movies, 'stats': stats,
-                    'episodes': sum(int(x.get('have_eps') or x.get('total_episodes') or 0) for x in series),
+                    'episodes': eps, 'episode_total': eps,
                     'top_missing': top[:10], 'source': 'emby_tmdb_cache'}
         return {}
     except Exception as e:
@@ -483,7 +446,6 @@ def gap_report(max_age=30 * 60, force_refresh=False, cache_only=False):
     # 手动完结标记只在这里应用一次（_apply_manual_done_to_series 内已把 missing/ongoing 改为 aligned，
     # 之前这里又按 manual_done 重算了一遍，属于同一份数据在两层各算一次）。
     series = _apply_manual_done_to_series(data.get('series') or [])
-    save_library_snapshot(build_library_health_snapshot(max_age=max_age))
     stats = {'total': len(series), 'aligned': 0, 'missing': 0, 'extra': 0,
              'ongoing': 0, 'ongoing_lagging': 0, 'unmatched': 0}
     missing = []
@@ -601,7 +563,6 @@ def action_emby_library(args):
     if with_tmdb:
         try:
             save_emby_lib_cache(result)
-            save_library_snapshot(build_library_health_snapshot())
         except Exception as e:
             log.warning('保存统一片库对照缓存失败: %s', e)
     return result
@@ -803,9 +764,6 @@ def _patch_all_caches(patch):
     """对 内存 / 总览磁盘 / TMDB 对照磁盘 三份缓存各调用一次 patch(data)->bool，改动了就落盘（保留原时间戳）。"""
     if state._emby_lib_cache.get('data'):
         patch(state._emby_lib_cache['data'])
-    disk = _load_overview_disk()
-    if disk and patch(disk['data']):
-        _save_overview_disk(disk['data'])
     tmdb_cache = read_emby_lib_cache()
     if tmdb_cache and patch(tmdb_cache):
         save_emby_lib_cache(tmdb_cache, keep_ts=True)
@@ -916,11 +874,6 @@ def refresh_mapping_cache_after_ingest(ingest_data: dict) -> dict:
 
     _patch_all_caches(_patch)
 
-    # 探索/总览还有一层 library_snapshot，必须一起失效/更新，否则会继续显示旧缺集。
-    snap = load_library_snapshot(max_age=None, background_refresh=False)
-    if snap and _patch(snap):
-        save_library_snapshot(snap)
-
     result['status'] = 'updated'
     return result
 
@@ -984,18 +937,6 @@ def read_emby_lib_cache(max_age=None):
     if max_age is not None and time.time() - data.get('ts', 0) > max_age:
         return None
     return data
-
-def get_tmdb_scan_progress() -> dict:
-    p = dict(state._tmdb_scan_progress)
-    if p['running'] and p['started_at']:
-        p['elapsed_sec'] = int(time.time() - p['started_at'])
-        p['eta_sec'] = int(p['elapsed_sec'] / p['done'] * (p['total'] - p['done'])) if p['done'] > 0 else None
-        p['percent'] = int(p['done'] / p['total'] * 100) if p['total'] else 0
-    else:
-        p['elapsed_sec'] = (p['finished_at'] - p['started_at']) if p['finished_at'] and p['started_at'] else 0
-        p['eta_sec'] = None
-        p['percent'] = 100 if p['finished_at'] else 0
-    return p
 
 def refresh_tmdb_scan():
     """后台跑一次完整 TMDB 对照并落盘（带进度上报）。单飞：网页「强制对照」和定时预热
@@ -1076,7 +1017,6 @@ def _refresh_tmdb_scan():
                'ts': time.time(),
                'data_time': time.strftime('%Y-%m-%d %H:%M', time.localtime())}
         save_emby_lib_cache(res)
-        save_library_snapshot(build_library_health_snapshot())
         _cfg.update_config(lambda c: c.__setitem__('tmdb_scan_last_ts', str(time.time())))
         state._tmdb_scan_progress.update({'running': False, 'finished_at': time.time(),
                                     'stage': '完成', 'stats': stats})

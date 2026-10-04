@@ -724,18 +724,19 @@ class TestScanSingleTraversal:
 
         engine.action_inter_check(self._Args())
 
-        assert engine._strm_count_cache['local'] == 2
-        assert engine._strm_count_cache['share'] == 3
-        disk = engine._load_strm_count_disk()
-        assert disk is not None and disk[0] == 2 and disk[1] == 3
+        # S7：strm_count 独立缓存层已删——计数并入统计缓存（单一来源）
+        data = engine._lib_stats_cache['data']
+        assert data is not None
+        assert data['local_total'] == 2 and data['share_total'] == 3
 
     def test_lib_cache_is_invalidated_after_scan(self):
-        """扫描后必须失效 Lib 缓存，保证随后的执行清理二次校验基于最新磁盘状态"""
+        """S7：Lib 30 秒缓存已删——每次 _get_lib 都现扫磁盘，天然保证执行清理前的
+        二次校验基于最新磁盘状态（旧断言「缓存为空」失效，改为现扫语义验证）。"""
         _reset_libs()
         _patch_strategy({'exempt_keywords': []})
         _strm(engine.L_ROOT, '缓存失效剧 (2020)/Season 01', 'E01.1080p.strm')
         engine.action_inter_check(self._Args())
-        assert engine._lib_cache == {}
+        assert engine._get_lib(engine.L_ROOT).by_base, '现扫应立即看到最新磁盘状态'
 
 
 # ═══════════════════ 入库静默期 ═══════════════════

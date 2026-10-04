@@ -46,6 +46,9 @@ DEFAULTS = {
     'subscribe_check_tmdb':      '1',   # 是否对照 TMDB 已播集
     # 订阅列表已移到 SQLite（storage.subscriptions 表），不再存配置
 
+    # 免登录（S7，白皮书 §5.9 / D5 默认关）：web_no_auth=1 且 WEB_PASSWORD 为空时
+    # Web 不做鉴权。公网域名下开启等于任何知道网址的人都能执行清理。
+    'web_no_auth':               '0',
     # reo 接入（S6 第一步，白皮书 §5.6 / D6）：URL 模板默认全空——
     # reo 网址格式等你把地址栏完整网址发来再填（绝不猜格式）；
     # 占位符支持 {tmdb_id}/{title}/{year}

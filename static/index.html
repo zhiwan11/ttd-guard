@@ -1832,6 +1832,14 @@ window.addEventListener('unhandledrejection', function(e){
             <input type="text" id="cfg-reo-search-url" placeholder="可选：TMDB ID 拿不到时的关键词搜索">
             <div class="masked-hint">兜底用：拿不到 TMDB ID 或选择按名称找时，用 <code>{title}</code>（自动 URL 编码）与 <code>{year}</code> 生成关键词搜索链接。</div>
           </div>
+          <div class="form-row">
+            <label>免登录（仅局域网）</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="checkbox" id="cfg-web-no-auth" style="width:auto">
+              <span style="font-size:12px;color:#6b7280">勾选且 WEB_PASSWORD 留空时，Web 管理台不做任何鉴权（默认关）</span>
+            </div>
+            <div class="masked-hint" style="color:#f59e0b">⚠️ 风险说明（仅此一次）：你的网站有公网域名（frp / 域名反代）时，免登录等于任何知道网址的人都能点「执行清理」删文件。是否开启由你决定。</div>
+          </div>
           <div style="display:flex;gap:8px;margin-top:20px">
             <button class="btn green" onclick="saveConfig()" data-icon="save">保存配置</button>
             <button class="btn gray" onclick="loadConfig()" data-icon="undo">重置</button>
@@ -2086,31 +2094,11 @@ var currentPlan = null;
 var currentCleanDetail = [];   // 最近一次治理执行的逐条明细（P2 弹层「复制明细」用）
 var govData = { loc: [], shr: [], keep: [], exempt: [] };
 var currentGovFilter = 'all';
-/* 双库治理的扫描结果只存在内存里，浏览器一刷新（F5）就没了，用户经常因此
-   "看不到数据"。这里把扫描结果顺带存一份到 sessionStorage，刷新后能原样恢复。 */
-function saveGovStateToSession(){
-  try {
-    sessionStorage.setItem('govState', JSON.stringify({ currentPlan: currentPlan, govData: govData }));
-  } catch(e){}
-}
-function restoreGovStateFromSession(){
-  try {
-    var raw = sessionStorage.getItem('govState');
-    if (!raw) return false;
-    var saved = JSON.parse(raw);
-    if (!saved || !saved.govData) return false;
-    currentPlan = saved.currentPlan || null;
-    govData = saved.govData;
-    if ($('govExecBtn')) $('govExecBtn').disabled = !currentPlan;
-    $('govStats').style.display = '';
-    $('gov-keep').textContent  = govData.keep.length;
-    $('gov-loc').textContent   = govData.loc.length;
-    $('gov-shr').textContent   = govData.shr.length;
-    $('gov-exempt').textContent = (govData.exemptTotal != null ? govData.exemptTotal : govData.exempt.length);
-    renderGovList();
-    return true;
-  } catch(e){ return false; }
-}
+/* S7：govState sessionStorage 第二份副本已删——治理扫描结果以「最近扫描」
+   （loadLatestGov 读 /api/gov/latest）为唯一来源，刷新后由它原样恢复，
+   不再维护一份会与服务器清单状态（TTL/已执行）脱节的浏览器副本。 */
+function saveGovStateToSession(){ /* 兼容壳：S7 已删（见上） */ }
+function restoreGovStateFromSession(){ return false; }
 /* ── 清单时效：Web 与 Bot/定时巡检共用同一份「最近扫描」，超过时效即作废，需重新扫描 ── */
 var govPlanExpireAt = 0, govScanTs = 0, govPlanTtlMs = 2 * 3600 * 1000;
 function fmtGovAgo(sec){
@@ -2222,9 +2210,7 @@ async function loadLatestGov(){
     return true;
   } catch(e){ return false; }
 }
-function clearGovStateSession(){
-  try { sessionStorage.removeItem('govState'); } catch(e){}
-}
+function clearGovStateSession(){ /* 兼容壳：S7 已删（govState 不再写入） */ }
 var statsAutoLoaded = false;
 var revealed = {};
 var currentStrategy = { decision: 'quality_first', match_strategy: 'title_year', multi_season_protect: 'compare', tie_keep_local: false, season_replace_ratio: 0.9, exempt_keywords: [], special_action: 'compare' };
@@ -2510,7 +2496,7 @@ function switchTab(id){
   try { sessionStorage.setItem('lastTab', id); } catch(e){}
 
   if (id === 'dashboard')  loadDashboard();
-  if (id === 'governance') { if (!currentPlan) restoreGovStateFromSession(); loadLatestGov(); loadGovTruth(); }
+  if (id === 'governance') { loadLatestGov(); loadGovTruth(); }
   if (id === 'explore')    { ensureExploreAutoRefresh(); loadExplore(); }
   else if (typeof ensureExploreAutoRefresh === 'function') stopExploreAutoRefresh();
   if (id === 'settings')   { loadConfig(); loadBotStatus(); loadStrategy(); loadIngest(); loadGovAuto(); loadCoverStrategy(); }
@@ -2650,39 +2636,16 @@ syncTick();
 })();
 
 /* ═══════════ 治理总览 ═══════════ */
-/* 后端 /api/dashboard、/api/library_stats 本身已经带缓存了（5分钟/30秒 TTL），
-   但前端每次打开页面都是先显示"-"/"检查中..."占位符，等接口返回才填真实值，
-   视觉上像是"每次都在重新刷新"。这里加一层本地缓存，页面一打开就先用上次的
-   数据瞬间填满（不再有占位符闪烁），网络请求仍然照常发，回来后静默更新即可。 */
-function saveDashboardCache(d){
-  try { localStorage.setItem('dashboardCache', JSON.stringify(d)); } catch(e){}
-}
-function saveLibStatsCache(r){
-  try { localStorage.setItem('libStatsCache', JSON.stringify(r)); } catch(e){}
-}
-function hydrateDashboardFromCache(){
-  try { var raw3 = localStorage.getItem('dashEmbyCache'); if (raw3) renderDashEmby(JSON.parse(raw3)); } catch(e){}
-  try {
-    var raw = localStorage.getItem('dashboardCache');
-    if (raw) renderDashboard(JSON.parse(raw));
-  } catch(e){}
-  try {
-    var raw2 = localStorage.getItem('libStatsCache');
-    if (raw2) renderLibraryStats(JSON.parse(raw2));
-  } catch(e){}
-}
-
+/* S7 缓存收敛：浏览器端 dashboardCache/libStatsCache/dashEmbyCache 已删
+   （白皮书 :326——浏览器端只保留主题偏好）。后端 /api/dashboard、/api/library_stats
+   自带服务端缓存与失效总线，页面打开直接拉取，多端一致且不会看到过期数字。 */
 async function loadLibraryStats(){
   try {
     var r = await api('/api/library_stats');
     if (r.status !== 'success') throw new Error(r.message || '\u5931\u8d25');
     renderLibraryStats(r);
-    saveLibStatsCache(r);
   } catch(e){
-    // 有缓存的话保留缓存显示的内容，不要用错误信息把已经填好的数据覆盖掉
-    if (!localStorage.getItem('libStatsCache')) {
-      $('libStatsGrid').innerHTML = '<div class="list-empty">\u52a0\u8f7d\u5931\u8d25: ' + esc(e.message) + '</div>';
-    }
+    $('libStatsGrid').innerHTML = '<div class="list-empty">\u52a0\u8f7d\u5931\u8d25: ' + esc(e.message) + '</div>';
   }
 }
 var libStatMode = 'all';
@@ -2776,7 +2739,6 @@ async function loadDashEmby(){
   var sum = { series: st.total_series || src.series.length, movies: st.total_movies || src.movies.length, eps: src.episodes != null ? src.episodes : src.series.reduce(function(n,s){ return n + (s.have_eps || s.total_episodes || 0); },0),
               st: { aligned: st.aligned || 0, missing: st.missing || 0, extra: st.extra || 0, ongoing: st.ongoing || 0, unmatched: (st.unmatched || 0) + (st.no_tmdb || 0) }, top: top };
   renderDashEmby(sum);
-  try { localStorage.setItem('dashEmbyCache', JSON.stringify(sum)); } catch(e){}
 }
 
 function renderDashPlanFromDashboard(d){
@@ -2837,7 +2799,6 @@ async function loadDashboard(){
   if (d) {
     renderDashboard(d);
     renderDashPlanFromDashboard(d);
-    saveDashboardCache(d);
   }
 }
 function renderDashboard(d){
@@ -3650,7 +3611,7 @@ var tmdbProgressTimer = null;
 
 async function pollTmdbProgress(){
   try {
-    var r = await api('/api/tmdb/progress');
+    var r = await api('/api/emby/library?progress=1');   // S7：progress 并入本端点
     var p = r.progress || {};
     if (p.running) {
       document.getElementById('tmdbProgressWrap').classList.remove('hidden');
@@ -5250,6 +5211,7 @@ async function loadConfig(){
     $('cfg-reo-tv-url').value     = c.reo_tv_url || '';
     $('cfg-reo-movie-url').value  = c.reo_movie_url || '';
     $('cfg-reo-search-url').value = c.reo_search_url || '';
+    $('cfg-web-no-auth').checked = (c.web_no_auth || '0') == '1';
     /* S6：reo 模板缓存给卡片按钮用（与后端 reo.enabled 双保险） */
     window.__reoTemplates = { reo_tv_url: c.reo_tv_url || '',
                               reo_movie_url: c.reo_movie_url || '',
@@ -5338,6 +5300,7 @@ async function saveConfig(){
     reo_tv_url:     $('cfg-reo-tv-url').value.trim(),
     reo_movie_url:  $('cfg-reo-movie-url').value.trim(),
     reo_search_url: $('cfg-reo-search-url').value.trim(),
+    web_no_auth:    $('cfg-web-no-auth').checked ? '1' : '0',
   };
   try {
     var r = await api('/api/config', { method: 'POST', body: JSON.stringify(body) });
@@ -5645,9 +5608,7 @@ document.addEventListener('DOMContentLoaded', async function(){
   switchExploreTab_init();
   buildSubnavs();
   setupInfiniteScroll();
-  // 先用本地缓存的数据瞬间填满治理总览，避免每次打开/刷新都先看到一堆
-  // "-"/"检查中..."占位符再变成真实数据，视觉上不再像"每次都在重新刷新"。
-  hydrateDashboardFromCache();
+  // S7：浏览器端 dashboardCache 已删——治理总览直接拉后端（服务端缓存+失效总线）。
   // 预加载订阅列表（供探索页订阅按钮用）
   try { var r = await api('/api/subscriptions'); currentSubs = r.subscriptions || []; } catch(e){}
   var lastTab = 'dashboard';

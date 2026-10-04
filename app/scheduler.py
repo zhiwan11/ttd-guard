@@ -179,7 +179,7 @@ def _tick(now: float):
     # 失败时最多 30 分钟重试一次，避免 Emby/TMDB 不可用时每 30 秒刷一遍
     if scan_enabled and (now - last_ts) >= scan_hours * 3600 \
             and now - _bg_state['last_tmdb_attempt'] >= TMDB_RETRY_SEC \
-            and not morning.get_tmdb_scan_progress().get('running'):
+            and not state._tmdb_scan_progress.get('running'):
         _bg_state['last_tmdb_attempt'] = now
         threading.Thread(target=morning.refresh_tmdb_scan, daemon=True, name='tmdb-scan').start()
 

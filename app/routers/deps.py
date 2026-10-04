@@ -19,21 +19,30 @@ WEB_PASSWORD = os.environ.get('WEB_PASSWORD', '').strip()
 ALLOW_NO_AUTH = os.environ.get('ALLOW_NO_AUTH', '').strip() == '1'
 
 if not WEB_PASSWORD:
-    _msg = (
-        '未设置 WEB_PASSWORD：Web 管理台不做任何鉴权，'
-        '任何能访问到这个端口的人都可以直接登录并执行清理。'
+    # S7（§5.9 / D5 默认关）：空密码不再拒绝启动——是否免登录由设置页
+    # 「免登录（仅局域网）」开关（config: web_no_auth，默认 0）显式决定；
+    # 这里只提示一次。auth() 的实际放行看 web_no_auth。
+    logging.getLogger('media_agent').warning(
+        '未设置 WEB_PASSWORD：Web 管理台是否免登录由设置页「免登录（仅局域网）」开关'
+        '（web_no_auth，默认关）决定。公网域名下开启免登录等于任何知道网址的人都能执行清理。'
     )
-    if ALLOW_NO_AUTH:
-        logging.getLogger('media_agent').warning('%s 已通过 ALLOW_NO_AUTH=1 显式放行，继续启动。', _msg)
-    else:
-        logging.getLogger('media_agent').error(
-            '%s 拒绝启动。请设置 WEB_USER / WEB_PASSWORD，'
-            '或明确知道风险后设置 ALLOW_NO_AUTH=1 跳过此检查。', _msg
-        )
-        raise SystemExit(1)
 
 # 版本号由 Docker 构建时按 git tag 注入（APP_VERSION），本地直接运行显示 dev
 APP_VERSION = os.environ.get('APP_VERSION', 'dev')
+
+
+def _no_auth_mode() -> bool:
+    """免登录是否生效（D5 默认关）：web_no_auth=1（设置页开关）或环境变量
+    ALLOW_NO_AUTH=1（旧隐式路径，保留兼容）且 WEB_PASSWORD 为空。"""
+    if WEB_PASSWORD:
+        return False
+    if ALLOW_NO_AUTH:
+        return True
+    try:
+        from app import config as _cfg
+        return (_cfg.load_config().get('web_no_auth') or '0') == '1'
+    except Exception:
+        return False
 
 
 _security = HTTPBasic(auto_error=False)
@@ -65,8 +74,8 @@ def auth(request: Request = None, credentials: HTTPBasicCredentials = Depends(_s
         credentials, request = request, None
     if not isinstance(credentials, HTTPBasicCredentials):
         credentials = None
-    if not WEB_PASSWORD:
-        return True  # 仅当 ALLOW_NO_AUTH=1 放行启动时才会走到这里
+    if _no_auth_mode():
+        return True  # 免登录（web_no_auth=1 或 ALLOW_NO_AUTH=1，且 WEB_PASSWORD 为空）
     tok = request.cookies.get(SESSION_COOKIE) if request is not None else None
     if tok and _verify_session(tok):
         return True
