@@ -46,6 +46,13 @@ DEFAULTS = {
     'subscribe_check_tmdb':      '1',   # 是否对照 TMDB 已播集
     # 订阅列表已移到 SQLite（storage.subscriptions 表），不再存配置
 
+    # reo 接入（S6 第一步，白皮书 §5.6 / D6）：URL 模板默认全空——
+    # reo 网址格式等你把地址栏完整网址发来再填（绝不猜格式）；
+    # 占位符支持 {tmdb_id}/{title}/{year}
+    'reo_tv_url':                '',    # 剧集模板：地址栏完整前缀（到 tmdb_id 数字之前）+ {tmdb_id}
+    'reo_movie_url':             '',    # 电影模板：同上（TV/Movie 的 TMDB ID 空间独立！）
+    'reo_search_url':            '',    # 兜底：关键词搜索模板（{title}/{year}）
+
     # 晨报
     'morning_report_enabled':    '0',
     'morning_report_hour':       '9',

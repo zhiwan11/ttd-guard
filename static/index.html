@@ -1817,6 +1817,21 @@ window.addEventListener('unhandledrejection', function(e){
             <label>Telegram 允许用户（白名单）</label>
             <input type="text" id="cfg-tg-users" placeholder="逗号分隔的 User ID">
           </div>
+          <div class="form-row">
+            <label>reo 剧集 URL 模板（{tmdb_id}/{title}/{year}）</label>
+            <input type="text" id="cfg-reo-tv-url" placeholder="留空则不显示「在 reo 找资源」按钮">
+            <div class="masked-hint">从 reo 地址栏复制的<b>完整前缀</b>（到剧集 tmdb_id 数字之前），末尾接 <code>{tmdb_id}</code>。例如 <code>https://…/series/</code>（示意，格式以你复制的为准）</div>
+          </div>
+          <div class="form-row">
+            <label>reo 电影 URL 模板（{tmdb_id}/{title}/{year}）</label>
+            <input type="text" id="cfg-reo-movie-url" placeholder="留空则不显示「在 reo 找资源」按钮">
+            <div class="masked-hint">从 reo 地址栏复制的<b>完整前缀</b>（到电影 tmdb_id 数字之前），末尾接 <code>{tmdb_id}</code>。⚠️ TMDB 的剧集与电影 ID 空间<b>相互独立</b>：同一个数字在两边是两部不同的作品，模板必须分类型各填各的。</div>
+          </div>
+          <div class="form-row">
+            <label>reo 兜底搜索 URL 模板（{title}/{year}）</label>
+            <input type="text" id="cfg-reo-search-url" placeholder="可选：TMDB ID 拿不到时的关键词搜索">
+            <div class="masked-hint">兜底用：拿不到 TMDB ID 或选择按名称找时，用 <code>{title}</code>（自动 URL 编码）与 <code>{year}</code> 生成关键词搜索链接。</div>
+          </div>
           <div style="display:flex;gap:8px;margin-top:20px">
             <button class="btn green" onclick="saveConfig()" data-icon="save">保存配置</button>
             <button class="btn gray" onclick="loadConfig()" data-icon="undo">重置</button>
@@ -2835,6 +2850,8 @@ function renderDashboard(d){
       var hv = $('headerVersion'); if (hv) hv.textContent = 'v' + d.version;
     }
     var embyOk = d.services && d.services.emby && d.services.emby.ok;
+    /* S6：dashboard 的 reo.enabled 兜底（loadConfig 未跑过/失败时至少有 enabled 标记） */
+    if (d.reo && !window.__reoTemplates) window.__reoTemplates = {};
     $('svc-emby').innerHTML = embyOk ? statusOk('在线') : statusNo('离线');
     $('svc-emby-host').textContent = (d.services && d.services.emby && d.services.emby.host) || '—';
     /* 缓存 Emby 主机地址，供 showEmbyDetailById 里的"在 Emby 中打开"链接使用 */
@@ -3053,6 +3070,47 @@ async function runClean(){
     renderGovList();
     setGovBanner('✅ 清理已完成，清单已用完。需要查看最新状态时请点「重新扫描」');
   } catch(e){ toast(e.message, 'error', 4000); }
+}
+
+/* ═══════════ S6 reo：在 reo 找资源（第一步：生成并打开链接） ═══════════
+   模板存配置 reo_tv_url/reo_movie_url/reo_search_url（占位符 {tmdb_id}/{title}/{year}）；
+   TV 与 Movie 的 TMDB ID 空间独立——模板按类型取，同一数字不会串到另一类型（A9）。
+   window.__reoTemplates 由 loadConfig 时 /api/config 下发（三模板全空则按钮不渲染，
+   与后端 /api/dashboard 的 reo.enabled 双保险）；第二步「推送手动 strm 频道」暂不做。 */
+window.__reoTemplates = null;
+function reoBuildUrl(mediaType, tmdbId, title, year, forceSearch){
+  var t = window.__reoTemplates || {};
+  var tpl = (!forceSearch && tmdbId)
+    ? (mediaType === 'movie' ? (t.reo_movie_url || '') : (t.reo_tv_url || ''))
+    : '';
+  var url;
+  if (tpl) {
+    url = tpl.replace('{tmdb_id}', encodeURIComponent(tmdbId || ''))
+             .replace('{title}', encodeURIComponent(title || ''))
+             .replace('{year}', encodeURIComponent(year || ''));
+  } else if ((t.reo_search_url || '') && (title || '').trim()) {
+    url = (t.reo_search_url || '')
+      .replace('{tmdb_id}', encodeURIComponent(tmdbId || ''))
+      .replace('{title}', encodeURIComponent(title || ''))
+      .replace('{year}', encodeURIComponent(year || ''));
+  } else {
+    return '';                                  // 全空/无效：调用方不渲染按钮
+  }
+  return url;
+}
+/* 点击「在 reo 找资源」：新标签页打开，TTD Guard 不保存账号、不抓取页面（§5.6 第一步） */
+function openReo(mediaType, tmdbId, title, year, forceSearch){
+  var url = reoBuildUrl(mediaType, tmdbId, title, year, forceSearch);
+  if (!url) { toast('尚未配置 reo URL 模板（设置页）', 'error'); return; }
+  window.open(url, '_blank', 'noopener');
+}
+function reoBtnHtml(mediaType, tmdbId, title, year, cls){
+  if (!window.__reoTemplates) return '';        // 未加载配置：不渲染（双保险之一）
+  var url = reoBuildUrl(mediaType, tmdbId, title, year, false);
+  if (!url) return '';                          // 三个模板全空：不渲染（双保险之二）
+  return '<button class="btn sm ' + (cls || 'gray') + '" onclick="openReo('
+    + jsarg(mediaType) + ',' + jsarg(String(tmdbId || '')) + ','
+    + jsarg(title || '') + ',' + jsarg(String(year || '')) + ')">在 reo 找资源</button>';
 }
 
 /* ═══════════ 影视探索 ═══════════ */
@@ -3374,6 +3432,10 @@ function _exploreCardHtml(c, subSet){
   var subBtn = c.type === 'tv'
     ? '<button class="sub-btn ' + (isSub ? 'on' : '') + '" data-tmdb="' + esc(c.tmdb_id) + '" data-title="' + esc(c.title) + '" data-poster="' + esc(c.poster || '') + '">' + (isSub ? '✓ 已订阅' : '+ 订阅') + '</button>'
     : '';
+  /* S6（§5.6）：未入库卡「在 reo 找资源」——优先 TMDB ID 模板；三模板全空不渲染。
+     st.cls==='no' 即「未入库」徽标（exploreStatus 判定，含第二段 fact.matched=false）。 */
+  var reoBtn = (st.cls === 'no')
+    ? reoBtnHtml(c.type, c.tmdb_id, c.title, c.year, 'gray') : '';
   return '<div class="poster-card" data-explore-tmdb="' + esc(c.tmdb_id) + '">'
     + '<div class="poster-wrap">' + posterHtml
     + '<span class="badge-type">' + typeLabel + '</span>'
@@ -3384,7 +3446,7 @@ function _exploreCardHtml(c, subSet){
     + '<div class="t" title="' + esc(c.title) + '">' + esc(c.title) + '</div>'
     + '<div class="meta"><span>' + (c.year || '—') + ' · TMDB</span>'
     + '<span class="eps-info" style="font-size:11px;color:#9ca3af;display:none"></span>'
-    + subBtn + '</div>'
+    + subBtn + reoBtn + '</div>'
     + '</div>'
     + '</div>';
 }
@@ -3895,6 +3957,9 @@ function renderSeriesCard(s){
     epInfo = (s.total_seasons || 0) + ' 季 · ' + (s.total_episodes || 0) + ' 集';
   }
 
+  /* S6（§5.6）：映射「缺集」卡「在 reo 找资源」（在更·落后也算缺着看）；模板全空不渲染 */
+  var reoBtn = (mst === 'missing' || mst === 'ongoing_lagging')
+    ? reoBtnHtml('tv', s.tmdb_id, s.name || '', s.year || '', 'gray') : '';
   return '<div class="poster-card emby-poster-card st-' + mst + '" onclick="showEmbyDetailById(' + jsarg(s.id) + ')">'
     + '<div class="poster-wrap">' + poster
     + '<span class="badge-type">剧集</span>'
@@ -3902,7 +3967,7 @@ function renderSeriesCard(s){
     + '</div>'
     + '<div class="info">'
     + '<div class="t" title="' + esc(s.name || '?') + '">' + esc(s.name || '?') + '</div>'
-    + '<div class="meta"><span>' + (s.year || '—') + ' · ' + libTag + '</span></div>'
+    + '<div class="meta"><span>' + (s.year || '—') + ' · ' + libTag + '</span>' + reoBtn + '</div>'
     + '<div class="meta"><span style="color:var(--text-dim);font-size:10px">' + epInfo + '</span></div>'
     + '</div>'
     + '</div>';
@@ -4339,6 +4404,7 @@ async function loadSubscriptions(){
           + live + notified + watched
           + '</div>'
           + '<div class="actions">'
+          + reoBtnHtml('tv', s.tmdb_id, s.name, (s.added_at || '').slice(0, 4), 'gray')
           + '<button class="btn sm ' + (s.enabled ? 'green' : 'gray') + '" onclick="toggleSubEnabled(' + i + ')">' + (s.enabled ? '启用' : '暂停') + '</button>'
           + '<button class="btn sm red" onclick="removeSub(' + i + ')">删</button>'
           + '</div>'
@@ -5181,6 +5247,13 @@ async function loadConfig(){
     $('cfg-tg-token').value  = c.telegram_bot_token || '';
     $('cfg-tg-chat').value   = c.telegram_chat_id || '';
     $('cfg-tg-users').value  = c.telegram_allowed_users || '';
+    $('cfg-reo-tv-url').value     = c.reo_tv_url || '';
+    $('cfg-reo-movie-url').value  = c.reo_movie_url || '';
+    $('cfg-reo-search-url').value = c.reo_search_url || '';
+    /* S6：reo 模板缓存给卡片按钮用（与后端 reo.enabled 双保险） */
+    window.__reoTemplates = { reo_tv_url: c.reo_tv_url || '',
+                              reo_movie_url: c.reo_movie_url || '',
+                              reo_search_url: c.reo_search_url || '' };
     ['emby_key','tmdb_key','telegram_bot_token'].forEach(function(k){
       var btn = document.querySelector('.eye-btn[data-eye="' + k + '"]');
       if (btn) { btn.classList.remove('on'); btn.innerHTML = icon('eye') + '<span>查看</span>'; }
@@ -5262,6 +5335,9 @@ async function saveConfig(){
     telegram_bot_token:     $('cfg-tg-token').value.trim(),
     telegram_chat_id:       $('cfg-tg-chat').value.trim(),
     telegram_allowed_users: $('cfg-tg-users').value.trim(),
+    reo_tv_url:     $('cfg-reo-tv-url').value.trim(),
+    reo_movie_url:  $('cfg-reo-movie-url').value.trim(),
+    reo_search_url: $('cfg-reo-search-url').value.trim(),
   };
   try {
     var r = await api('/api/config', { method: 'POST', body: JSON.stringify(body) });

@@ -4,7 +4,7 @@ import time, threading
 from fastapi import APIRouter, Depends, HTTPException
 
 from app import config as _cfg
-from app import state, governance, morning, ingest, emby, stats, bot, tasks, subscribe, sync
+from app import state, governance, morning, ingest, emby, stats, bot, tasks, subscribe, sync, reo
 from app.routers.deps import auth, _current_task_dict, APP_VERSION
 
 router = APIRouter()
@@ -97,6 +97,10 @@ def dashboard():
                     'telegram': {'ok': tg_ok, 'bot_running': bs.get('running'),
                                  'bot_username': bs.get('bot_username'),
                                  'bot_state': bs.get('state')}},
+                # S6：reo 模板是否已配置——前端据此渲染/隐藏「在 reo 找资源」按钮
+                #（接口不下发模板本身；点按钮时前端走本地生成的同款占位符逻辑，
+                #  三个模板全空则按钮不渲染，双保险见 app/reo.py）
+                'reo': {'enabled': reo.reo_enabled()},
                 'subscriptions': {'total': len(subs),
                                   'enabled': sum(1 for s in subs if s.get('enabled', True))},
                 'morningReport': {'enabled': mr.get('enabled'),
